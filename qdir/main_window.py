@@ -107,6 +107,27 @@ class QDirMainWindow(QMainWindow):
 
     def _build_menu_bar(self):
         menubar = self.menuBar()
+        menubar.setStyleSheet("""
+            QMenuBar {
+                background-color: transparent;
+                color: palette(window-text);
+            }
+            QMenuBar::item {
+                background: transparent;
+                color: palette(window-text);
+                padding: 4px 8px;
+                margin: 1px 2px;
+                border-radius: 4px;
+            }
+            QMenuBar::item:selected {
+                background-color: palette(highlight);
+                color: palette(highlighted-text);
+            }
+            QMenuBar::item:pressed {
+                background-color: palette(highlight);
+                color: palette(highlighted-text);
+            }
+        """)
 
         # --- Menu Arquivo ---
         menu_file = menubar.addMenu("&Arquivo")

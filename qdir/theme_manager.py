@@ -181,4 +181,52 @@ def apply_system_theme(app: QApplication) -> bool:
             app.setPalette(dark_pal)
             applied = True
 
+    # 3. Garante contraste perfeito para barras de menus e menus dropdown
+    # (Evita que estilos como Breeze forcem texto escuro #232629 sobre fundo escuro da janela)
+    menu_qss = """
+    QMenuBar {
+        background-color: transparent;
+        color: palette(window-text);
+    }
+    QMenuBar::item {
+        background: transparent;
+        color: palette(window-text);
+        padding: 4px 8px;
+        margin: 1px 2px;
+        border-radius: 4px;
+    }
+    QMenuBar::item:selected {
+        background-color: palette(highlight);
+        color: palette(highlighted-text);
+    }
+    QMenuBar::item:pressed {
+        background-color: palette(highlight);
+        color: palette(highlighted-text);
+    }
+    QMenu {
+        background-color: palette(window);
+        color: palette(window-text);
+        border: 1px solid rgba(128, 128, 128, 0.4);
+        padding: 4px 0;
+    }
+    QMenu::item {
+        padding: 4px 24px 4px 16px;
+        color: palette(window-text);
+    }
+    QMenu::item:selected {
+        background-color: palette(highlight);
+        color: palette(highlighted-text);
+    }
+    QMenu::separator {
+        height: 1px;
+        background: rgba(128, 128, 128, 0.3);
+        margin: 4px 8px;
+    }
+    """
+    existing_ss = app.styleSheet()
+    if existing_ss:
+        app.setStyleSheet(existing_ss + "\n" + menu_qss)
+    else:
+        app.setStyleSheet(menu_qss)
+
     return applied
