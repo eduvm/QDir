@@ -32,8 +32,10 @@ import send2trash
 
 def open_file_default(filepath: str):
     """Abre arquivo com aplicativo padrão do sistema Linux."""
-    from PyQt6.QtCore import QUrl
-    QDesktopServices.openUrl(QUrl.fromLocalFile(filepath))
+    from qdir.mime_manager import MimeManager
+    if not MimeManager.launch_default(filepath):
+        from PyQt6.QtCore import QUrl
+        QDesktopServices.openUrl(QUrl.fromLocalFile(filepath))
 
 
 def open_in_terminal(dirpath: str):

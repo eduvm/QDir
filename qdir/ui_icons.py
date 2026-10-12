@@ -144,3 +144,66 @@ def get_ui_icon(icon_name: str, color: Optional[Union[QColor, str]] = None, size
     icon.addPixmap(dis_pix, QIcon.Mode.Disabled)
 
     return icon
+
+
+def get_drag_cursor_pixmap(action_name: str) -> QPixmap:
+    """
+    Retorna o QPixmap para o cursor de arrasto (drag cursor) estilo Double Commander:
+    - 'copy': Cursor com sinal '+'
+    - 'move': Cursor com indicador de movimento
+    """
+    import os
+    base_dir = os.path.join(os.path.dirname(__file__), "..", "resources", "cursors")
+    name_map = {
+        "copy": ["ArrowCopy.cur", "copy.png"],
+        "move": ["ArrowMove.cur", "move.png"],
+    }
+    candidates = name_map.get(action_name.lower(), [])
+    for c in candidates:
+        full_path = os.path.join(base_dir, c)
+        if os.path.exists(full_path):
+            pm = QPixmap(full_path)
+            if not pm.isNull():
+                return pm
+
+    # Fallback vetorial nítido se os arquivos não estiverem disponíveis
+    size = 32
+    pm = QPixmap(size, size)
+    pm.fill(Qt.GlobalColor.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+    # Desenha seta clássica de mouse
+    path = QPainterPath()
+    path.moveTo(2, 2)
+    path.lineTo(2, 20)
+    path.lineTo(7, 16)
+    path.lineTo(11, 24)
+    path.lineTo(14, 22)
+    path.lineTo(10, 14)
+    path.lineTo(16, 14)
+    path.closeSubpath()
+
+    p.setPen(QPen(QColor(0, 0, 0), 1.5))
+    p.setBrush(QBrush(QColor(255, 255, 255)))
+    p.drawPath(path)
+
+    # Badge no canto inferior direito
+    badge_rect = QRectF(14, 14, 16, 16)
+    p.setPen(QPen(QColor(0, 0, 0), 1.2))
+    if action_name.lower() == "copy":
+        p.setBrush(QBrush(QColor(40, 167, 69)))  # Verde
+        p.drawRoundedRect(badge_rect, 3, 3)
+        p.setPen(QPen(QColor(255, 255, 255), 2))
+        p.drawLine(QPointF(22, 17), QPointF(22, 27))
+        p.drawLine(QPointF(17, 22), QPointF(27, 22))
+    else:
+        p.setBrush(QBrush(QColor(0, 120, 215)))  # Azul
+        p.drawRoundedRect(badge_rect, 3, 3)
+        p.setPen(QPen(QColor(255, 255, 255), 2))
+        p.drawLine(QPointF(17, 22), QPointF(27, 22))
+        p.drawLine(QPointF(24, 19), QPointF(27, 22))
+        p.drawLine(QPointF(24, 25), QPointF(27, 22))
+
+    p.end()
+    return pm

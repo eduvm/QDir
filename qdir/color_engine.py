@@ -348,7 +348,7 @@ class RenameLineEdit(QLineEdit):
             QLineEdit {
                 background: palette(base);
                 color: palette(text);
-                border: 1px solid #0078d7;
+                border: 1px solid palette(highlight);
                 border-radius: 2px;
                 padding: 1px 2px;
                 selection-background-color: palette(highlight);

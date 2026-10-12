@@ -8,7 +8,7 @@ import os
 import shutil
 from typing import List, Optional
 
-from PyQt6.QtCore import QDir, QSize, Qt
+from PyQt6.QtCore import QDir, QSize, Qt, QTimer
 from PyQt6.QtGui import QAction, QActionGroup, QIcon, QKeySequence
 from PyQt6.QtWidgets import (
     QComboBox,
@@ -60,6 +60,7 @@ class QDirMainWindow(QMainWindow):
             pane = QDirPane(pane_id=i, color_engine=self.color_engine, parent=self)
             pane.activated.connect(self.on_pane_activated)
             pane.status_updated.connect(self.on_pane_status_updated)
+            pane.maximize_requested.connect(self.on_pane_maximize_requested)
             self.panes.append(pane)
 
         self.active_pane = self.panes[0]
@@ -249,6 +250,13 @@ class QDirMainWindow(QMainWindow):
         act_refresh_all.setShortcut(QKeySequence("F5"))
         act_refresh_all.triggered.connect(self.refresh_all_panes)
 
+        menu_view.addSeparator()
+
+        self.act_maximize = menu_view.addAction("Maximizar / Restaurar Painel Ativo")
+        self.act_maximize.setCheckable(True)
+        self.act_maximize.setShortcuts([QKeySequence("Ctrl+M"), QKeySequence("F11")])
+        self.act_maximize.triggered.connect(self.toggle_maximize_active_pane)
+
         # --- Menu Favoritos ---
         menu_fav = menubar.addMenu("&Favoritos")
         act_add_fav = menu_fav.addAction("Adicionar Pasta Atual aos Favoritos")
@@ -290,6 +298,13 @@ class QDirMainWindow(QMainWindow):
             self.combo_layout.addItem(f"{idx+1}. {name}")
         self.combo_layout.currentIndexChanged.connect(self.switch_layout)
         toolbar.addWidget(self.combo_layout)
+
+        # Botão Maximizar Painel Ativo
+        self.btn_maximize = QPushButton(" ⛶ Maximizar")
+        self.btn_maximize.setToolTip("Maximizar / Restaurar Painel Ativo (Ctrl+M ou F11)")
+        self.btn_maximize.setCheckable(True)
+        self.btn_maximize.clicked.connect(self.toggle_maximize_active_pane)
+        toolbar.addWidget(self.btn_maximize)
 
         toolbar.addSeparator()
 
@@ -360,7 +375,24 @@ class QDirMainWindow(QMainWindow):
         self.combo_layout.setCurrentIndex(layout_id)
         if 0 <= layout_id < len(self.layout_actions):
             self.layout_actions[layout_id].setChecked(True)
+        if hasattr(self, "btn_maximize"):
+            self.btn_maximize.setChecked(False)
+            self.btn_maximize.setText(" ⛶ Maximizar")
+        if hasattr(self, "act_maximize"):
+            self.act_maximize.setChecked(False)
         self.layout_manager.apply_layout(layout_id)
+
+    def on_pane_maximize_requested(self, pane_idx: int):
+        is_max = self.layout_manager.toggle_maximize_pane(pane_idx)
+        if hasattr(self, "btn_maximize"):
+            self.btn_maximize.setChecked(is_max)
+            self.btn_maximize.setText(" ⮌ Restaurar" if is_max else " ⛶ Maximizar")
+        if hasattr(self, "act_maximize"):
+            self.act_maximize.setChecked(is_max)
+
+    def toggle_maximize_active_pane(self):
+        active_idx = self.panes.index(self.active_pane) if self.active_pane in self.panes else 0
+        self.on_pane_maximize_requested(active_idx)
 
     def toggle_all_hidden(self, checked: bool):
         for pane in self.panes:
@@ -479,24 +511,33 @@ class QDirMainWindow(QMainWindow):
         return os.path.join(cfg_dir, "settings.json")
 
     def save_settings(self):
-        """Salva larguras de colunas, layout, árvores, abas e caminhos ao fechar."""
+        """Salva larguras de colunas, layout, largura da árvore de diretórios, abas e caminhos ao fechar."""
         try:
             cfg_path = self.get_settings_path()
             panes_data = []
             for p in self.panes:
                 tabs_list = []
                 for i in range(p.tabs.count()):
-                    tab_path = p.tabs.tabToolTip(i) or p.current_path
-                    tabs_list.append(tab_path)
+                    tab_path = p.get_tab_path(i)
+                    is_locked = p.is_tab_locked(i)
+                    tab_data = p.get_tab_data(i)
+                    tabs_list.append({
+                        "path": tab_path,
+                        "locked": is_locked,
+                        "root_path": tab_data.get("root_path", tab_path),
+                        "original_title": tab_data.get("original_title", os.path.basename(tab_path) or "/"),
+                    })
                 panes_data.append({
                     "current_path": p.current_path,
                     "column_widths": p.get_column_widths(),
-                    "tabs": tabs_list if tabs_list else [p.current_path],
+                    "tree_width": p.get_tree_width(),
+                    "tabs": tabs_list if tabs_list else [{"path": p.current_path, "locked": False}],
                 })
 
             data = {
                 "layout_id": self.layout_manager.current_layout_id,
                 "tree_mode": self.layout_manager.current_tree_mode,
+                "shared_tree_width": self.layout_manager.get_shared_tree_width(),
                 "window_width": self.width(),
                 "window_height": self.height(),
                 "is_maximized": self.isMaximized(),
@@ -509,7 +550,7 @@ class QDirMainWindow(QMainWindow):
             print(f"Erro ao salvar configurações do QDir: {e}")
 
     def load_settings(self):
-        """Carrega larguras de colunas, layout e abas salvas."""
+        """Carrega larguras de colunas, largura da árvore, layout e abas salvas."""
         cfg_path = self.get_settings_path()
         if os.path.exists(cfg_path):
             try:
@@ -522,23 +563,47 @@ class QDirMainWindow(QMainWindow):
                 elif "window_width" in data and "window_height" in data:
                     self.resize(data["window_width"], data["window_height"])
 
+                if "shared_tree_width" in data:
+                    self.layout_manager.set_shared_tree_width(int(data["shared_tree_width"]))
+
                 layout_id = data.get("layout_id", 0)
                 self.switch_layout(layout_id)
-
-                tree_mode = data.get("tree_mode", 0)
-                self.combo_tree.setCurrentIndex(tree_mode)
-                self.layout_manager.set_tree_mode(tree_mode)
 
                 panes_data = data.get("panes", [])
                 for i, p_info in enumerate(panes_data):
                     if i < len(self.panes):
                         pane = self.panes[i]
+                        # Restaura largura da árvore individual antes de ativar o tree_mode
+                        tree_w = p_info.get("tree_width")
+                        if tree_w:
+                            pane.set_tree_width(int(tree_w))
+
                         tabs = p_info.get("tabs", [])
                         if tabs:
-                            pane.navigate_to(tabs[0], record_history=False)
+                            while pane.tabs.count() > 1:
+                                pane.tabs.removeTab(pane.tabs.count() - 1)
+
+                            first_t = tabs[0]
+                            first_path = first_t.get("path") if isinstance(first_t, dict) else first_t
+                            first_locked = first_t.get("locked", False) if isinstance(first_t, dict) else False
+                            first_root = first_t.get("root_path") if isinstance(first_t, dict) else None
+                            first_title = first_t.get("original_title") if isinstance(first_t, dict) else None
+
+                            if first_path and os.path.isdir(first_path):
+                                pane.set_tab_locked(0, False)
+                                pane.navigate_to(first_path, record_history=False)
+                                if first_locked:
+                                    pane.set_tab_locked(0, True, root_path=first_root, original_title=first_title)
+                                else:
+                                    pane.set_tab_locked(0, False)
+
                             for t in tabs[1:]:
-                                if os.path.isdir(t):
-                                    pane.add_tab(t)
+                                t_path = t.get("path") if isinstance(t, dict) else t
+                                t_locked = t.get("locked", False) if isinstance(t, dict) else False
+                                t_root = t.get("root_path") if isinstance(t, dict) else None
+                                t_title = t.get("original_title") if isinstance(t, dict) else None
+                                if t_path and os.path.isdir(t_path):
+                                    pane.add_tab(t_path, locked=t_locked, root_path=t_root, original_title=t_title)
                         elif "current_path" in p_info:
                             pane.navigate_to(p_info["current_path"], record_history=False)
 
@@ -546,6 +611,13 @@ class QDirMainWindow(QMainWindow):
                         col_widths = p_info.get("column_widths")
                         if col_widths and isinstance(col_widths, list):
                             pane.set_column_widths(col_widths)
+
+                tree_mode = data.get("tree_mode", 0)
+                self.combo_tree.setCurrentIndex(tree_mode)
+                self.layout_manager.set_tree_mode(tree_mode)
+
+                # Re-aplica larguras salvas dos splitters de árvore após o layout estabilizar na tela
+                QTimer.singleShot(50, self._restore_splitter_widths)
                 return
             except Exception as e:
                 print(f"Erro ao carregar configurações do QDir: {e}")
@@ -554,6 +626,23 @@ class QDirMainWindow(QMainWindow):
         start_qdr = os.path.join(os.path.dirname(__file__), "..", "Q-Dir Windows", "start.qdr")
         if os.path.exists(start_qdr):
             self.load_session_qdr(start_qdr)
+
+    def _restore_splitter_widths(self):
+        """Garante que as larguras salvas dos divisores da árvore sejam reaplicadas após renderização completa."""
+        if self.layout_manager.is_pane_maximized():
+            return
+        if self.layout_manager.current_tree_mode == 2 and not self.layout_manager.shared_tree.isHidden():
+            w = self.layout_manager.shared_tree_width
+            total = self.layout_manager.outer_splitter.width()
+            if total > w and w > 0:
+                self.layout_manager.outer_splitter.setSizes([w, total - w])
+        elif self.layout_manager.current_tree_mode == 1:
+            for p in self.panes:
+                if not p.tree_view.isHidden():
+                    w = p.tree_width
+                    total = p.inner_splitter.width()
+                    if total > w and w > 0:
+                        p.inner_splitter.setSizes([w, total - w])
 
     def show_color_rules(self):
         """Abre diálogo para editar, adicionar, remover e reordenar regras de cores."""

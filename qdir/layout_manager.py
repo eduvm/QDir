@@ -45,6 +45,9 @@ class LayoutManager(QWidget):
         self.panes = panes
         self.current_layout_id: int = 0
         self.current_tree_mode: int = 0  # 0: Sem Árvores, 1: 4 Árvores, 2: 1 Compartilhada
+        self.shared_tree_width: int = 240
+        self.maximized_pane_idx: Optional[int] = None
+        self.pre_maximize_layout_id: int = 0
 
         self.root_layout = QHBoxLayout(self)
         self.root_layout.setContentsMargins(0, 0, 0, 0)
@@ -72,6 +75,7 @@ class LayoutManager(QWidget):
         self.outer_splitter.addWidget(self.container_widget)
         self.outer_splitter.setStretchFactor(0, 0)
         self.outer_splitter.setStretchFactor(1, 1)
+        self.outer_splitter.splitterMoved.connect(self._on_outer_splitter_moved)
 
         self.root_layout.addWidget(self.outer_splitter)
 
@@ -93,6 +97,7 @@ class LayoutManager(QWidget):
             layout_id = 0
 
         self.current_layout_id = layout_id
+        self.maximized_pane_idx = None
 
         # 1. Desanexa os painéis do layout anterior sem destruí-los
         for pane in self.panes:
@@ -263,6 +268,67 @@ class LayoutManager(QWidget):
 
         return QWidget()
 
+    def is_pane_maximized(self) -> bool:
+        return self.maximized_pane_idx is not None
+
+    def maximize_pane(self, pane_index: int):
+        if not (0 <= pane_index < len(self.panes)):
+            return
+
+        if self.maximized_pane_idx is None:
+            self.pre_maximize_layout_id = self.current_layout_id
+
+        self.maximized_pane_idx = pane_index
+
+        for pane in self.panes:
+            pane.setParent(None)
+
+        while self.container_layout.count():
+            item = self.container_layout.takeAt(0)
+            widget = item.widget()
+            if widget:
+                widget.deleteLater()
+
+        for i, pane in enumerate(self.panes):
+            pane.setVisible(i == pane_index)
+
+        container = QWidget()
+        box = QVBoxLayout(container)
+        box.setContentsMargins(0, 0, 0, 0)
+        box.addWidget(self.panes[pane_index])
+        self.container_layout.addWidget(container)
+
+    def restore_maximize(self):
+        self.maximized_pane_idx = None
+        self.apply_layout(self.pre_maximize_layout_id)
+
+    def toggle_maximize_pane(self, pane_index: int) -> bool:
+        """Alterna entre maximizar o painel e restaurar o layout multi-painel anterior."""
+        if self.maximized_pane_idx == pane_index:
+            self.restore_maximize()
+            return False
+        else:
+            self.maximize_pane(pane_index)
+            return True
+
+    def _on_outer_splitter_moved(self, pos: int, index: int):
+        if index == 1 and pos > 0:
+            self.shared_tree_width = pos
+
+    def get_shared_tree_width(self) -> int:
+        if not self.shared_tree.isHidden():
+            sizes = self.outer_splitter.sizes()
+            if sizes and sizes[0] > 0:
+                self.shared_tree_width = sizes[0]
+        return self.shared_tree_width
+
+    def set_shared_tree_width(self, width: int):
+        if width > 0:
+            self.shared_tree_width = width
+            if self.current_tree_mode == 2 and not self.shared_tree.isHidden():
+                total = max(width + 100, self.outer_splitter.width())
+                self.outer_splitter.setSizes([width, total - width])
+
     def set_tree_mode(self, mode: int):
         """0: Sem Árvores, 1: 4 Árvores (individuais), 2: 1 Árvore Compartilhada."""
         self.current_tree_mode = mode
@@ -278,7 +344,9 @@ class LayoutManager(QWidget):
             for pane in self.panes:
                 pane.set_tree_visible(False)
             self.shared_tree.show()
-            self.outer_splitter.setSizes([200, 800])
+            w = self.shared_tree_width if self.shared_tree_width > 0 else 240
+            total = max(w + 100, self.outer_splitter.width())
+            self.outer_splitter.setSizes([w, total - w])
             for col in range(1, 4):
                 self.shared_tree.setColumnHidden(col, True)
             target_pane = next((p for p in self.panes if p.is_active and p.isVisible()), None)

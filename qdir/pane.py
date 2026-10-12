@@ -56,7 +56,7 @@ from PyQt6.QtWidgets import (
 
 from qdir.clipboard_manager import QDirClipboard
 from qdir.color_engine import ColorEngine, QDirColorDelegate
-from qdir.ui_icons import get_ui_icon
+from qdir.ui_icons import get_drag_cursor_pixmap, get_ui_icon
 from qdir.file_ops import (
     BatchRenameDialog,
     copy_or_move_items,
@@ -65,6 +65,7 @@ from qdir.file_ops import (
     open_in_terminal,
     trash_items,
 )
+from qdir.mime_manager import MimeManager
 
 
 class QDirFilterProxyModel(QSortFilterProxyModel):
@@ -214,14 +215,52 @@ class DroppableTabBar(QTabBar):
         if event.button() == Qt.MouseButton.MiddleButton:
             tab_idx = self.tabAt(event.position().toPoint())
             if tab_idx >= 0:
-                self.pane.on_tab_close(tab_idx)
+                if not self.pane.is_tab_locked(tab_idx):
+                    self.pane.on_tab_close(tab_idx)
                 event.accept()
                 return
         super().mouseReleaseEvent(event)
 
+    def contextMenuEvent(self, event):
+        pos = event.pos()
+        tab_idx = self.tabAt(pos)
+        if tab_idx < 0:
+            menu = QMenu(self)
+            act_new = menu.addAction("Nova Aba")
+            act_new.triggered.connect(lambda: self.pane.add_tab())
+            menu.exec(event.globalPos())
+            return
+
+        menu = QMenu(self)
+        is_locked = self.pane.is_tab_locked(tab_idx)
+        act_lock = menu.addAction("🔒 Bloquear Aba (Apenas Subdiretórios)")
+        act_lock.setCheckable(True)
+        act_lock.setChecked(is_locked)
+        act_lock.triggered.connect(lambda: self.pane.toggle_tab_lock(tab_idx))
+
+        menu.addSeparator()
+
+        act_new = menu.addAction("Nova Aba")
+        act_new.triggered.connect(lambda: self.pane.add_tab())
+
+        act_dup = menu.addAction("Duplicar Aba")
+        act_dup.triggered.connect(lambda: self.pane.duplicate_tab(tab_idx))
+
+        act_close = menu.addAction("Fechar Aba")
+        act_close.setEnabled(self.count() > 1 and not is_locked)
+        act_close.triggered.connect(lambda: self.pane.on_tab_close(tab_idx))
+
+        menu.exec(event.globalPos())
+
+
     def dragEnterEvent(self, event):
         if event.mimeData().hasUrls():
-            event.acceptProposedAction()
+            mods = QApplication.keyboardModifiers()
+            if mods & Qt.KeyboardModifier.ControlModifier:
+                event.setDropAction(Qt.DropAction.MoveAction)
+            else:
+                event.setDropAction(Qt.DropAction.CopyAction)
+            event.accept()
         else:
             super().dragEnterEvent(event)
 
@@ -236,7 +275,13 @@ class DroppableTabBar(QTabBar):
             else:
                 self._hover_timer.stop()
                 self._hover_tab_idx = -1
-            event.acceptProposedAction()
+
+            mods = QApplication.keyboardModifiers()
+            if mods & Qt.KeyboardModifier.ControlModifier:
+                event.setDropAction(Qt.DropAction.MoveAction)
+            else:
+                event.setDropAction(Qt.DropAction.CopyAction)
+            event.accept()
         else:
             super().dragMoveEvent(event)
 
@@ -253,14 +298,15 @@ class DroppableTabBar(QTabBar):
             tab_idx = self.tabAt(pos)
             target_dir = self.pane.current_path
             if tab_idx >= 0:
-                tip = self.tabToolTip(tab_idx)
+                tip = self.pane.get_tab_path(tab_idx)
                 if tip and os.path.isdir(tip):
                     target_dir = tip
 
             urls = event.mimeData().urls()
             paths = [u.toLocalFile() for u in urls if u.isLocalFile()]
-            is_move = (event.dropAction() == Qt.DropAction.MoveAction) or (
-                QApplication.keyboardModifiers() & Qt.KeyboardModifier.ShiftModifier
+            mods = QApplication.keyboardModifiers()
+            is_move = bool(mods & Qt.KeyboardModifier.ControlModifier) or (
+                event.dropAction() == Qt.DropAction.MoveAction
             )
             event.acceptProposedAction()
             # Postpone handling until after dropEvent finishes and QDrag releases pointer grab
@@ -303,8 +349,22 @@ class FileTableView(QTableView):
         self.setColumnWidth(1, 90)
         self.setColumnWidth(2, 100)
         self.setColumnWidth(3, 140)
-
         self.doubleClicked.connect(self.on_double_click)
+
+    def mouseDoubleClickEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            idx = self.indexAt(event.position().toPoint())
+            if idx.isValid():
+                self.on_double_click(idx)
+                event.accept()
+                return
+        super().mouseDoubleClickEvent(event)
+
+    def setRootIndex(self, index: QModelIndex):
+        super().setRootIndex(index)
+        self.verticalScrollBar().setValue(0)
+        self.horizontalScrollBar().setValue(0)
+        self.scrollToTop()
 
     def get_column_widths(self) -> list:
         return [self.columnWidth(c) for c in range(4)]
@@ -459,17 +519,43 @@ class FileTableView(QTableView):
             mime_data = self.pane.fs_model.mimeData(valid_src_indexes)
             mime_data.setUrls(urls)
             drag.setMimeData(mime_data)
-            drag.exec(Qt.DropAction.CopyAction | Qt.DropAction.MoveAction)
+
+            # Cursores customizados estilo Double Commander (+ para copiar, seta para mover)
+            copy_pm = get_drag_cursor_pixmap("copy")
+            move_pm = get_drag_cursor_pixmap("move")
+            if not copy_pm.isNull():
+                drag.setDragCursor(copy_pm, Qt.DropAction.CopyAction)
+            if not move_pm.isNull():
+                drag.setDragCursor(move_pm, Qt.DropAction.MoveAction)
+
+            # Regra invertida: padrão (sem teclas) = Copiar; com Control = Mover
+            mods = QApplication.keyboardModifiers()
+            default_action = (
+                Qt.DropAction.MoveAction
+                if (mods & Qt.KeyboardModifier.ControlModifier)
+                else Qt.DropAction.CopyAction
+            )
+            drag.exec(Qt.DropAction.CopyAction | Qt.DropAction.MoveAction, default_action)
 
     def dragEnterEvent(self, event):
         if event.mimeData().hasUrls():
-            event.acceptProposedAction()
+            mods = QApplication.keyboardModifiers()
+            if mods & Qt.KeyboardModifier.ControlModifier:
+                event.setDropAction(Qt.DropAction.MoveAction)
+            else:
+                event.setDropAction(Qt.DropAction.CopyAction)
+            event.accept()
         else:
             super().dragEnterEvent(event)
 
     def dragMoveEvent(self, event):
         if event.mimeData().hasUrls():
-            event.acceptProposedAction()
+            mods = QApplication.keyboardModifiers()
+            if mods & Qt.KeyboardModifier.ControlModifier:
+                event.setDropAction(Qt.DropAction.MoveAction)
+            else:
+                event.setDropAction(Qt.DropAction.CopyAction)
+            event.accept()
         else:
             super().dragMoveEvent(event)
 
@@ -490,8 +576,9 @@ class FileTableView(QTableView):
                     if sub_path and os.path.isdir(sub_path):
                         target_dir = sub_path
 
-            is_move = (event.dropAction() == Qt.DropAction.MoveAction) or (
-                QApplication.keyboardModifiers() & Qt.KeyboardModifier.ShiftModifier
+            mods = QApplication.keyboardModifiers()
+            is_move = bool(mods & Qt.KeyboardModifier.ControlModifier) or (
+                event.dropAction() == Qt.DropAction.MoveAction
             )
             event.acceptProposedAction()
             # Postpone handling until after dropEvent finishes and QDrag releases pointer grab
@@ -506,6 +593,7 @@ class QDirPane(QFrame):
     activated = pyqtSignal(object)  # Emite self quando ativado
     path_changed = pyqtSignal(str)
     status_updated = pyqtSignal(str)
+    maximize_requested = pyqtSignal(int)
 
     def __init__(self, pane_id: int, color_engine: ColorEngine, parent=None):
         super().__init__(parent)
@@ -515,6 +603,7 @@ class QDirPane(QFrame):
         self.history: List[str] = [self.current_path]
         self.history_index: int = 0
         self.is_active: bool = False
+        self.tree_width: int = 180
 
         # Configuração visual do Frame do Painel
         self.setFrameShape(QFrame.Shape.StyledPanel)
@@ -540,6 +629,9 @@ class QDirPane(QFrame):
         # Rótulo de identificação do painel (#1, #2, #3, #4)
         self.lbl_id = QLabel(f"#{self.pane_id}")
         self.lbl_id.setStyleSheet("font-weight: bold; padding: 0 4px;")
+        self.lbl_id.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.lbl_id.setToolTip(f"Painel #{self.pane_id} (Duplo clique para maximizar/restaurar)")
+        self.lbl_id.mouseDoubleClickEvent = lambda e: self.maximize_requested.emit(self.pane_id - 1)
         nav_layout.addWidget(self.lbl_id)
 
         # Botões de Navegação
@@ -622,6 +714,7 @@ class QDirPane(QFrame):
         self.fs_model.setReadOnly(False)
         self.fs_model.setRootPath("")
         self.fs_model.setFilter(QDir.Filter.AllEntries | QDir.Filter.NoDot | QDir.Filter.Hidden)
+        self.fs_model.directoryLoaded.connect(self._on_directory_loaded)
 
         self.proxy_model = QDirFilterProxyModel(self)
         self.proxy_model.setSourceModel(self.fs_model)
@@ -655,12 +748,19 @@ class QDirPane(QFrame):
         self.inner_splitter.addWidget(self.table_view)
         self.inner_splitter.setStretchFactor(0, 0)
         self.inner_splitter.setStretchFactor(1, 1)
+        self.inner_splitter.splitterMoved.connect(self._on_inner_splitter_moved)
 
         main_layout.addWidget(self.inner_splitter, stretch=1)
 
         # Adiciona aba inicial
         tab_name = os.path.basename(self.current_path) or "/"
         idx = self.tabs.addTab(tab_name)
+        self.tabs.setTabData(idx, {
+            "locked": False,
+            "root_path": self.current_path,
+            "original_title": tab_name,
+            "current_path": self.current_path,
+        })
         self.tabs.setTabToolTip(idx, self.current_path)
 
         # 4. Barra Inferior de Filtros em Tempo Real (Positivo e Negativo)
@@ -702,33 +802,76 @@ class QDirPane(QFrame):
         self.is_active = active
         if active:
             self.setStyleSheet(
-                f"#QDirPane_{self.pane_id} {{ border: 2px solid #0078d7; border-radius: 4px; }}"
+                f"#QDirPane_{self.pane_id} {{ border: 2px solid palette(highlight); border-radius: 4px; }}"
             )
-            self.lbl_id.setStyleSheet("font-weight: bold; color: #0078d7; background: rgba(0, 120, 215, 0.2); border-radius: 3px; padding: 1px 6px;")
+            self.lbl_id.setStyleSheet(
+                "font-weight: bold; color: palette(highlighted-text); background-color: palette(highlight); border-radius: 3px; padding: 1px 6px;"
+            )
         else:
             self.setStyleSheet(
-                f"#QDirPane_{self.pane_id} {{ border: 1px solid rgba(128, 128, 128, 0.3); border-radius: 4px; }}"
+                f"#QDirPane_{self.pane_id} {{ border: 2px solid rgba(128, 128, 128, 0.35); border-radius: 4px; }}"
             )
-            self.lbl_id.setStyleSheet("font-weight: normal; color: palette(window-text); padding: 1px 6px;")
+            self.lbl_id.setStyleSheet(
+                "font-weight: normal; color: palette(window-text); background-color: rgba(128, 128, 128, 0.15); border-radius: 3px; padding: 1px 6px;"
+            )
 
     def navigate_to(self, path: str, record_history: bool = True):
         path = os.path.abspath(os.path.expanduser(path))
         if not os.path.exists(path) or not os.path.isdir(path):
             return
 
+        cur_tab = self.tabs.currentIndex()
+        if cur_tab >= 0 and self.is_tab_locked(cur_tab):
+            data = self.get_tab_data(cur_tab)
+            root_path = data.get("root_path")
+            if root_path:
+                norm_target = os.path.realpath(path)
+                norm_root = os.path.realpath(root_path)
+                is_sub = False
+                try:
+                    if norm_target == norm_root or os.path.commonpath([norm_target, norm_root]) == norm_root:
+                        is_sub = True
+                except ValueError:
+                    is_sub = False
+
+                if not is_sub:
+                    # Fora da raiz bloqueada! Ignora completamente o comando.
+                    self.txt_path.setText(self.current_path)
+                    return
+
         self.current_path = path
         self.txt_path.setText(path)
+
+        # Limpa seleção e índice corrente do diretório anterior
+        self.table_view.selectionModel().clear()
+        self.table_view.setCurrentIndex(QModelIndex())
 
         src_index = self.fs_model.setRootPath(path)
         proxy_index = self.proxy_model.mapFromSource(src_index)
         self.table_view.setRootIndex(proxy_index)
 
-        # Atualiza título da aba corrente
-        cur_tab = self.tabs.currentIndex()
+        # Garante rolagem para o início do topo imediatamente e em passagens assíncronas
+        self._reset_view_scroll_to_top()
+        QTimer.singleShot(0, self._reset_view_scroll_to_top)
+        QTimer.singleShot(50, self._reset_view_scroll_to_top)
+        QTimer.singleShot(150, self._reset_view_scroll_to_top)
+
+        # Atualiza título e dados da aba corrente
         if cur_tab >= 0:
-            tab_name = os.path.basename(path) or "/"
-            self.tabs.setTabText(cur_tab, tab_name)
-            self.tabs.setTabToolTip(cur_tab, path)
+            data = self.get_tab_data(cur_tab)
+            data["current_path"] = path
+            if self.is_tab_locked(cur_tab):
+                title = data.get("original_title") or os.path.basename(data.get("root_path", path)) or "/"
+                root = data.get("root_path", path)
+                self.tabs.setTabText(cur_tab, f"🔒 {title}")
+                self.tabs.setTabToolTip(cur_tab, f"{path} (Bloqueada em: {root})")
+            else:
+                tab_name = os.path.basename(path) or "/"
+                self.tabs.setTabText(cur_tab, tab_name)
+                self.tabs.setTabToolTip(cur_tab, path)
+                data["original_title"] = tab_name
+                data["root_path"] = path
+            self.tabs.setTabData(cur_tab, data)
 
         if record_history:
             if not self.history or self.history[self.history_index] != path:
@@ -750,15 +893,47 @@ class QDirPane(QFrame):
 
     def go_back(self):
         if self.history_index > 0:
+            target = self.history[self.history_index - 1]
+            cur_tab = self.tabs.currentIndex()
+            if cur_tab >= 0 and self.is_tab_locked(cur_tab):
+                data = self.get_tab_data(cur_tab)
+                root = data.get("root_path")
+                if root:
+                    try:
+                        norm_target = os.path.realpath(target)
+                        norm_root = os.path.realpath(root)
+                        if norm_target != norm_root and os.path.commonpath([norm_target, norm_root]) != norm_root:
+                            return
+                    except ValueError:
+                        return
             self.history_index -= 1
-            self.navigate_to(self.history[self.history_index], record_history=False)
+            self.navigate_to(target, record_history=False)
 
     def go_forward(self):
         if self.history_index < len(self.history) - 1:
+            target = self.history[self.history_index + 1]
+            cur_tab = self.tabs.currentIndex()
+            if cur_tab >= 0 and self.is_tab_locked(cur_tab):
+                data = self.get_tab_data(cur_tab)
+                root = data.get("root_path")
+                if root:
+                    try:
+                        norm_target = os.path.realpath(target)
+                        norm_root = os.path.realpath(root)
+                        if norm_target != norm_root and os.path.commonpath([norm_target, norm_root]) != norm_root:
+                            return
+                    except ValueError:
+                        return
             self.history_index += 1
-            self.navigate_to(self.history[self.history_index], record_history=False)
+            self.navigate_to(target, record_history=False)
 
     def go_up(self):
+        cur_tab = self.tabs.currentIndex()
+        if cur_tab >= 0 and self.is_tab_locked(cur_tab):
+            data = self.get_tab_data(cur_tab)
+            root = data.get("root_path")
+            if root and os.path.realpath(self.current_path) == os.path.realpath(root):
+                return
         parent_dir = os.path.dirname(self.current_path)
         if parent_dir and parent_dir != self.current_path:
             self.navigate_to(parent_dir)
@@ -766,6 +941,20 @@ class QDirPane(QFrame):
     def refresh(self):
         self.fs_model.setRootPath("")
         self.navigate_to(self.current_path, record_history=False)
+
+    def _reset_view_scroll_to_top(self):
+        self.table_view.verticalScrollBar().setValue(0)
+        self.table_view.horizontalScrollBar().setValue(0)
+        self.table_view.scrollToTop()
+        proxy_index = self.table_view.rootIndex()
+        if self.proxy_model.rowCount(proxy_index) > 0:
+            first_idx = self.proxy_model.index(0, 0, proxy_index)
+            if not self.table_view.selectionModel().hasSelection():
+                self.table_view.setCurrentIndex(first_idx)
+
+    def _on_directory_loaded(self, path: str):
+        if os.path.realpath(path) == os.path.realpath(self.current_path):
+            self._reset_view_scroll_to_top()
 
     def on_path_entered(self):
         entered = self.txt_path.text().strip()
@@ -786,37 +975,144 @@ class QDirPane(QFrame):
         self.proxy_model.set_filters(pos_text, neg_text, show_hidden)
         self.update_status()
 
+    def _on_inner_splitter_moved(self, pos: int, index: int):
+        if index == 1 and pos > 0:
+            self.tree_width = pos
+
+    def get_tree_width(self) -> int:
+        if not self.tree_view.isHidden():
+            sizes = self.inner_splitter.sizes()
+            if sizes and sizes[0] > 0:
+                self.tree_width = sizes[0]
+        return self.tree_width
+
+    def set_tree_width(self, width: int):
+        if width > 0:
+            self.tree_width = width
+            if not self.tree_view.isHidden():
+                total = max(width + 100, self.inner_splitter.width())
+                self.inner_splitter.setSizes([width, total - width])
+
     def set_tree_visible(self, visible: bool):
         self.tree_view.setVisible(visible)
         if visible:
             for col in range(1, 4):
                 self.tree_view.setColumnHidden(col, True)
-            self.inner_splitter.setSizes([160, 450])
+            w = self.tree_width if self.tree_width > 0 else 180
+            total = max(w + 100, self.inner_splitter.width())
+            self.inner_splitter.setSizes([w, total - w])
             tree_idx = self.tree_model.index(self.current_path)
             self.tree_view.setCurrentIndex(tree_idx)
             self.tree_view.scrollTo(tree_idx)
 
-    # Gerenciamento de Abas
-    def add_tab(self, path: Optional[str] = None):
+    # Gerenciamento de Abas e Bloqueio
+    def get_tab_data(self, index: int) -> dict:
+        if 0 <= index < self.tabs.count():
+            data = self.tabs.tabData(index)
+            if isinstance(data, dict):
+                return data
+        return {}
+
+    def get_tab_path(self, index: int) -> str:
+        if 0 <= index < self.tabs.count():
+            data = self.get_tab_data(index)
+            path = data.get("current_path")
+            if path and os.path.isdir(path):
+                return path
+            tip = self.tabs.tabToolTip(index)
+            if tip:
+                if " (Bloqueada em:" in tip:
+                    tip = tip.split(" (Bloqueada em:")[0]
+                if os.path.isdir(tip):
+                    return tip
+        return self.current_path
+
+    def is_tab_locked(self, index: int) -> bool:
+        if 0 <= index < self.tabs.count():
+            data = self.get_tab_data(index)
+            return bool(data.get("locked"))
+        return False
+
+    def set_tab_locked(
+        self,
+        index: int,
+        locked: bool,
+        root_path: Optional[str] = None,
+        original_title: Optional[str] = None,
+    ):
+        if not (0 <= index < self.tabs.count()):
+            return
+        data = self.get_tab_data(index)
+        current_tab_path = data.get("current_path") or self.tabs.tabToolTip(index) or self.current_path
+        if " (Bloqueada em:" in current_tab_path:
+            current_tab_path = current_tab_path.split(" (Bloqueada em:")[0]
+
+        if locked:
+            root = os.path.abspath(os.path.realpath(root_path or current_tab_path))
+            title = original_title or os.path.basename(root) or "/"
+            data["locked"] = True
+            data["root_path"] = root
+            data["original_title"] = title
+            data["current_path"] = current_tab_path
+            self.tabs.setTabData(index, data)
+            self.tabs.setTabText(index, f"🔒 {title}")
+            self.tabs.setTabToolTip(index, f"{current_tab_path} (Bloqueada em: {root})")
+        else:
+            data["locked"] = False
+            self.tabs.setTabData(index, data)
+            path_for_title = current_tab_path if (index != self.tabs.currentIndex()) else self.current_path
+            tab_name = os.path.basename(path_for_title) or "/"
+            self.tabs.setTabText(index, tab_name)
+            self.tabs.setTabToolTip(index, path_for_title)
+
+    def toggle_tab_lock(self, index: int):
+        self.set_tab_locked(index, not self.is_tab_locked(index))
+
+    def duplicate_tab(self, index: int):
+        if 0 <= index < self.tabs.count():
+            path = self.get_tab_path(index)
+            is_locked = self.is_tab_locked(index)
+            data = self.get_tab_data(index)
+            root = data.get("root_path") if is_locked else None
+            title = data.get("original_title") if is_locked else None
+            self.add_tab(path, locked=is_locked, root_path=root, original_title=title)
+
+    def add_tab(
+        self,
+        path: Optional[str] = None,
+        locked: bool = False,
+        root_path: Optional[str] = None,
+        original_title: Optional[str] = None,
+    ):
         target_path = os.path.abspath(os.path.expanduser(path or self.current_path))
-        tab_name = os.path.basename(target_path) or "/"
+        tab_name = original_title or os.path.basename(target_path) or "/"
         idx = self.tabs.addTab(tab_name)
+        self.tabs.setTabData(idx, {
+            "locked": False,
+            "root_path": target_path,
+            "original_title": tab_name,
+            "current_path": target_path,
+        })
         self.tabs.setTabToolTip(idx, target_path)
         self.tabs.setCurrentIndex(idx)
         self.navigate_to(target_path)
+        if locked:
+            self.set_tab_locked(idx, True, root_path=root_path or target_path, original_title=original_title)
 
     def on_tab_close(self, index: int):
+        if self.is_tab_locked(index):
+            return
         if self.tabs.count() > 1:
             self.tabs.removeTab(index)
             cur_idx = self.tabs.currentIndex()
             if 0 <= cur_idx < self.tabs.count():
-                tab_path = self.tabs.tabToolTip(cur_idx)
+                tab_path = self.get_tab_path(cur_idx)
                 if tab_path and os.path.isdir(tab_path):
                     self.navigate_to(tab_path, record_history=False)
 
     def on_tab_changed(self, index: int):
         if 0 <= index < self.tabs.count():
-            tab_path = self.tabs.tabToolTip(index)
+            tab_path = self.get_tab_path(index)
             if tab_path and os.path.isdir(tab_path) and tab_path != self.current_path:
                 self.navigate_to(tab_path, record_history=False)
 
@@ -911,6 +1207,25 @@ class QDirPane(QFrame):
 
         act_open = menu.addAction("Abrir")
         act_open.triggered.connect(lambda: [open_file_default(p) for p in selected] if selected else None)
+
+        valid_files = [p for p in selected if os.path.isfile(p)]
+        if valid_files:
+            menu_open_with = menu.addMenu("Abrir com")
+            primary_file = valid_files[0]
+            apps = MimeManager.get_apps_for_file(primary_file)
+            for app in apps:
+                icon = QIcon.fromTheme(app.icon_name) if app.icon_name else QIcon()
+                title = app.display_title()
+                act_app = menu_open_with.addAction(icon, title)
+                act_app.triggered.connect(
+                    lambda checked=False, a=app, files=valid_files: MimeManager.launch_app(a, files)
+                )
+
+            if apps:
+                menu_open_with.addSeparator()
+
+            act_choose = menu_open_with.addAction("Escolher outro aplicativo...")
+            act_choose.triggered.connect(lambda checked=False, files=valid_files: self.open_with_dialog(files))
 
         act_term = menu.addAction("Abrir no Terminal")
         target_dir = selected[0] if (selected and os.path.isdir(selected[0])) else self.current_path
@@ -1068,3 +1383,12 @@ class QDirPane(QFrame):
                 self.refresh()
             except Exception as e:
                 QMessageBox.warning(self, "Erro", f"Não foi possível criar o arquivo: {e}")
+
+    def open_with_dialog(self, files: List[str]):
+        """Abre o diálogo 'Abrir com...' para os arquivos indicados."""
+        from qdir.open_with_dialog import OpenWithDialog
+        valid_files = [p for p in files if os.path.isfile(p)]
+        if not valid_files:
+            return
+        dlg = OpenWithDialog(valid_files, parent=self.window())
+        dlg.exec()
