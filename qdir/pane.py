@@ -891,7 +891,7 @@ class QDirPane(QFrame):
         msg_box.exec()
 
         if msg_box.clickedButton() == btn_yes:
-            count, errors = copy_or_move_items(valid_srcs, dst_dir, is_move)
+            count, errors = copy_or_move_items(valid_srcs, dst_dir, is_move, parent=self.window())
             if errors:
                 QMessageBox.warning(self.window(), "Erros na Operação", "\n".join(errors))
             self.refresh()
@@ -988,7 +988,7 @@ class QDirPane(QFrame):
             return
 
         action_name = "Mover" if is_move else "Copiar"
-        count, errors = copy_or_move_items(paths, target_dir, is_move=is_move)
+        count, errors = copy_or_move_items(paths, target_dir, is_move=is_move, parent=self.window())
         if errors:
             QMessageBox.warning(self.window(), f"Erros ao {action_name}", "\n".join(errors))
 

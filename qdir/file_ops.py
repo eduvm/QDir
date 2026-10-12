@@ -7,19 +7,22 @@ cálculo assíncrono de tamanho de pasta e Renomeação em Lote (Batch Rename).
 import os
 import shutil
 import subprocess
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
-from PyQt6.QtCore import QObject, QThread, pyqtSignal
+from PyQt6.QtCore import QObject, QThread, Qt, pyqtSignal
 from PyQt6.QtGui import QDesktopServices
 from PyQt6.QtWidgets import (
+    QCheckBox,
     QDialog,
     QDialogButtonBox,
+    QFrame,
     QHBoxLayout,
     QHeaderView,
     QLabel,
     QLineEdit,
     QMessageBox,
     QPushButton,
+    QStyle,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -92,25 +95,243 @@ def delete_items_permanently(paths: List[str]) -> Tuple[int, List[str]]:
     return success_count, errors
 
 
-def copy_or_move_items(src_paths: List[str], dst_dir: str, is_move: bool = False) -> Tuple[int, List[str]]:
-    """Copia ou move múltiplos itens para o diretório de destino."""
+def format_size(size_bytes: int) -> str:
+    """Formata tamanho de arquivo em formato legível (B, KB, MB, GB)."""
+    if size_bytes < 1024:
+        return f"{size_bytes} B"
+    elif size_bytes < 1024 * 1024:
+        return f"{size_bytes / 1024:.1f} KB"
+    elif size_bytes < 1024 * 1024 * 1024:
+        return f"{size_bytes / (1024 * 1024):.1f} MB"
+    else:
+        return f"{size_bytes / (1024 * 1024 * 1024):.2f} GB"
+
+
+def format_mtime(timestamp: float) -> str:
+    """Formata timestamp em data/hora legível."""
+    import datetime
+    dt = datetime.datetime.fromtimestamp(timestamp)
+    return dt.strftime("%d/%m/%Y %H:%M:%S")
+
+
+class FileConflictDialog(QDialog):
+    """Diálogo de resolução de conflito quando o arquivo de destino já existe."""
+
+    OVERWRITE = "overwrite"
+    KEEP_BOTH = "keep_both"
+    SKIP = "skip"
+    CANCEL = "cancel"
+
+    def __init__(
+        self,
+        src_path: str,
+        dst_path: str,
+        is_move: bool = False,
+        has_multiple: bool = False,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self.src_path = src_path
+        self.dst_path = dst_path
+        self.is_move = is_move
+        self.result_action = self.CANCEL
+        self.apply_to_all = False
+
+        action_name = "mover" if is_move else "copiar"
+        self.setWindowTitle("Substituir Arquivo Existente" if not is_move else "Substituir ao Mover")
+        self.setMinimumWidth(560)
+
+        layout = QVBoxLayout(self)
+        layout.setSpacing(12)
+
+        base_name = os.path.basename(dst_path)
+        is_dir = os.path.isdir(dst_path)
+        item_type = "uma pasta" if is_dir else "um arquivo"
+
+        # Mensagem Principal com ícone
+        header_layout = QHBoxLayout()
+        header_layout.setSpacing(12)
+
+        lbl_icon = QLabel()
+        icon = self.style().standardIcon(QStyle.StandardPixmap.SP_MessageBoxQuestion)
+        lbl_icon.setPixmap(icon.pixmap(48, 48))
+        header_layout.addWidget(lbl_icon)
+
+        text_layout = QVBoxLayout()
+        text_layout.setSpacing(4)
+        lbl_title = QLabel(f"<b>Já existe {item_type} com o nome \"{base_name}\" nesta pasta.</b>")
+        lbl_title.setStyleSheet("font-size: 13px;")
+        lbl_title.setWordWrap(True)
+        text_layout.addWidget(lbl_title)
+
+        lbl_sub = QLabel(f"Deseja substituir o item existente pelo novo que você está tentando {action_name}?")
+        lbl_sub.setStyleSheet("color: palette(window-text);")
+        lbl_sub.setWordWrap(True)
+        text_layout.addWidget(lbl_sub)
+        header_layout.addLayout(text_layout, stretch=1)
+
+        layout.addLayout(header_layout)
+
+        # Informações comparativas
+        def get_info(path: str) -> Tuple[str, str]:
+            if not os.path.exists(path):
+                return "-", "-"
+            try:
+                st = os.stat(path)
+                size_str = format_size(st.st_size) if not os.path.isdir(path) else "Pasta"
+                time_str = format_mtime(st.st_mtime)
+                return size_str, time_str
+            except Exception:
+                return "-", "-"
+
+        dst_size, dst_time = get_info(dst_path)
+        src_size, src_time = get_info(src_path)
+
+        box_info = QFrame()
+        box_info.setStyleSheet("""
+            QFrame {
+                background: palette(alternate-base);
+                border: 1px solid rgba(128, 128, 128, 0.3);
+                border-radius: 6px;
+                padding: 6px;
+            }
+        """)
+        info_layout = QVBoxLayout(box_info)
+        info_layout.setSpacing(8)
+
+        lbl_dst = QLabel(
+            f"<b>Existente no destino:</b><br>"
+            f"• Tamanho: {dst_size} &nbsp;&nbsp;|&nbsp;&nbsp; Modificado em: {dst_time}<br>"
+            f"<span style='font-size: 11px; color: #888;'>{dst_path}</span>"
+        )
+        lbl_dst.setTextFormat(Qt.TextFormat.RichText)
+        info_layout.addWidget(lbl_dst)
+
+        lbl_src = QLabel(
+            f"<b>Novo a ser {'movido' if is_move else 'copiado'}:</b><br>"
+            f"• Tamanho: {src_size} &nbsp;&nbsp;|&nbsp;&nbsp; Modificado em: {src_time}<br>"
+            f"<span style='font-size: 11px; color: #888;'>{src_path}</span>"
+        )
+        lbl_src.setTextFormat(Qt.TextFormat.RichText)
+        info_layout.addWidget(lbl_src)
+
+        layout.addWidget(box_info)
+
+        # Checkbox "Aplicar para todos" se houver múltiplos itens
+        if has_multiple:
+            self.chk_all = QCheckBox("Aplicar esta ação para todos os próximos conflitos")
+            layout.addWidget(self.chk_all)
+        else:
+            self.chk_all = None
+
+        # Botões de Ação
+        btn_layout = QHBoxLayout()
+        btn_layout.setSpacing(8)
+
+        btn_overwrite = QPushButton("Substituir")
+        btn_overwrite.setDefault(True)
+        btn_overwrite.setStyleSheet("font-weight: bold;")
+        btn_overwrite.clicked.connect(lambda: self._choose(self.OVERWRITE))
+        btn_layout.addWidget(btn_overwrite)
+
+        btn_keep = QPushButton("Manter Ambos")
+        btn_keep.setToolTip("Gera uma cópia numerada (ex: arquivo (1).ext)")
+        btn_keep.clicked.connect(lambda: self._choose(self.KEEP_BOTH))
+        btn_layout.addWidget(btn_keep)
+
+        btn_skip = QPushButton("Pular")
+        btn_skip.setToolTip("Ignora a transferência deste item")
+        btn_skip.clicked.connect(lambda: self._choose(self.SKIP))
+        btn_layout.addWidget(btn_skip)
+
+        btn_layout.addStretch(1)
+
+        btn_cancel = QPushButton("Cancelar")
+        btn_cancel.clicked.connect(lambda: self._choose(self.CANCEL))
+        btn_layout.addWidget(btn_cancel)
+
+        layout.addLayout(btn_layout)
+
+    def _choose(self, action: str):
+        self.result_action = action
+        if self.chk_all:
+            self.apply_to_all = self.chk_all.isChecked()
+        self.accept()
+
+
+def copy_or_move_items(
+    src_paths: List[str],
+    dst_dir: str,
+    is_move: bool = False,
+    parent=None,
+) -> Tuple[int, List[str]]:
+    """Copia ou move múltiplos itens para o diretório de destino com diálogo de confirmação para conflitos."""
     if not os.path.isdir(dst_dir):
         return 0, ["Diretório de destino inválido."]
 
+    clean_srcs = [p for p in src_paths if os.path.exists(p) and os.path.basename(p) not in ("..", ".")]
+    if not clean_srcs:
+        return 0, []
+
+    # Detecta previamente itens em conflito (já existentes no destino)
+    conflicts = [
+        s for s in clean_srcs
+        if os.path.exists(os.path.join(dst_dir, os.path.basename(s)))
+        and os.path.abspath(s) != os.path.abspath(os.path.join(dst_dir, os.path.basename(s)))
+    ]
+    has_multiple_conflicts = len(conflicts) > 1
+    apply_to_all_action = None
+
     success_count = 0
     errors = []
-    for src in src_paths:
+
+    for src in clean_srcs:
         try:
             base_name = os.path.basename(src)
             target = os.path.join(dst_dir, base_name)
 
-            # Evita sobrescrever arquivo no mesmo diretório
+            # Caso 1: Cópia no mesmo diretório (cria cópia automática sem perguntar)
             if os.path.abspath(src) == os.path.abspath(target):
                 name, ext = os.path.splitext(base_name)
                 counter = 1
                 while os.path.exists(target):
                     target = os.path.join(dst_dir, f"{name} (cópia {counter}){ext}")
                     counter += 1
+
+            # Caso 2: Conflito com item existente vindo de outra pasta
+            elif os.path.exists(target):
+                action = apply_to_all_action
+                if not action:
+                    dlg = FileConflictDialog(
+                        src_path=src,
+                        dst_path=target,
+                        is_move=is_move,
+                        has_multiple=has_multiple_conflicts,
+                        parent=parent,
+                    )
+                    dlg.exec()
+                    action = dlg.result_action
+                    if dlg.apply_to_all:
+                        apply_to_all_action = action
+
+                if action == FileConflictDialog.CANCEL:
+                    break
+                elif action == FileConflictDialog.SKIP:
+                    continue
+                elif action == FileConflictDialog.KEEP_BOTH:
+                    name, ext = os.path.splitext(base_name)
+                    counter = 1
+                    target = os.path.join(dst_dir, f"{name} ({counter}){ext}")
+                    while os.path.exists(target):
+                        counter += 1
+                        target = os.path.join(dst_dir, f"{name} ({counter}){ext}")
+                elif action == FileConflictDialog.OVERWRITE:
+                    if os.path.isdir(target) and not os.path.islink(target):
+                        shutil.rmtree(target)
+                    else:
+                        os.remove(target)
+                else:
+                    break
 
             if is_move:
                 shutil.move(src, target)
@@ -122,6 +343,7 @@ def copy_or_move_items(src_paths: List[str], dst_dir: str, is_move: bool = False
             success_count += 1
         except Exception as e:
             errors.append(f"{os.path.basename(src)}: {str(e)}")
+
     return success_count, errors
 
 
