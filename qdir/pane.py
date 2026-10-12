@@ -14,6 +14,7 @@ from PyQt6.QtCore import (
     QItemSelection,
     QModelIndex,
     QPoint,
+    QSize,
     QSortFilterProxyModel,
     Qt,
     QTimer,
@@ -55,6 +56,7 @@ from PyQt6.QtWidgets import (
 
 from qdir.clipboard_manager import QDirClipboard
 from qdir.color_engine import ColorEngine, QDirColorDelegate
+from qdir.ui_icons import get_ui_icon
 from qdir.file_ops import (
     BatchRenameDialog,
     copy_or_move_items,
@@ -542,28 +544,32 @@ class QDirPane(QFrame):
 
         # Botões de Navegação
         self.btn_back = QPushButton()
-        self.btn_back.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_ArrowBack))
+        self.btn_back.setIcon(get_ui_icon("back"))
+        self.btn_back.setIconSize(QSize(16, 16))
         self.btn_back.setToolTip("Voltar (Alt+Esquerda)")
         self.btn_back.setFixedWidth(28)
         self.btn_back.clicked.connect(self.go_back)
         nav_layout.addWidget(self.btn_back)
 
         self.btn_fwd = QPushButton()
-        self.btn_fwd.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_ArrowForward))
+        self.btn_fwd.setIcon(get_ui_icon("fwd"))
+        self.btn_fwd.setIconSize(QSize(16, 16))
         self.btn_fwd.setToolTip("Avançar (Alt+Direita)")
         self.btn_fwd.setFixedWidth(28)
         self.btn_fwd.clicked.connect(self.go_forward)
         nav_layout.addWidget(self.btn_fwd)
 
         self.btn_up = QPushButton()
-        self.btn_up.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_ArrowUp))
+        self.btn_up.setIcon(get_ui_icon("up"))
+        self.btn_up.setIconSize(QSize(16, 16))
         self.btn_up.setToolTip("Subir pasta (Alt+Cima)")
         self.btn_up.setFixedWidth(28)
         self.btn_up.clicked.connect(self.go_up)
         nav_layout.addWidget(self.btn_up)
 
         self.btn_refresh = QPushButton()
-        self.btn_refresh.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_BrowserReload))
+        self.btn_refresh.setIcon(get_ui_icon("refresh"))
+        self.btn_refresh.setIconSize(QSize(16, 16))
         self.btn_refresh.setToolTip("Atualizar (F5)")
         self.btn_refresh.setFixedWidth(28)
         self.btn_refresh.clicked.connect(self.refresh)
@@ -582,7 +588,8 @@ class QDirPane(QFrame):
 
         # Botão Terminal
         self.btn_term = QPushButton()
-        self.btn_term.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_CommandLink))
+        self.btn_term.setIcon(get_ui_icon("terminal"))
+        self.btn_term.setIconSize(QSize(16, 16))
         self.btn_term.setToolTip("Abrir no Terminal")
         self.btn_term.setFixedWidth(28)
         self.btn_term.clicked.connect(lambda: open_in_terminal(self.current_path))

@@ -37,6 +37,7 @@ from qdir.session_manager import SessionManager
 
 
 from qdir.color_dialog import ColorRulesDialog
+from qdir.ui_icons import get_ui_icon
 
 
 class QDirMainWindow(QMainWindow):
@@ -303,19 +304,22 @@ class QDirMainWindow(QMainWindow):
 
         # Botão Terminal
         btn_term = QPushButton(" Terminal")
-        btn_term.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_CommandLink))
+        btn_term.setIcon(get_ui_icon("terminal"))
+        btn_term.setIconSize(QSize(16, 16))
         btn_term.clicked.connect(lambda: open_in_terminal(self.active_pane.current_path))
         toolbar.addWidget(btn_term)
 
         # Botão Atualizar Todos
         btn_refresh = QPushButton(" Atualizar")
-        btn_refresh.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_BrowserReload))
+        btn_refresh.setIcon(get_ui_icon("refresh"))
+        btn_refresh.setIconSize(QSize(16, 16))
         btn_refresh.clicked.connect(self.refresh_all_panes)
         toolbar.addWidget(btn_refresh)
 
         # Botão Exportar
         btn_export = QPushButton(" Exportar...")
-        btn_export.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_DialogSaveButton))
+        btn_export.setIcon(get_ui_icon("export"))
+        btn_export.setIconSize(QSize(16, 16))
         btn_export.clicked.connect(lambda: self.export_active_dir("html"))
         toolbar.addWidget(btn_export)
 
@@ -323,7 +327,8 @@ class QDirMainWindow(QMainWindow):
 
         # Botão Salvar Sessão
         btn_session = QPushButton(" Salvar Sessão")
-        btn_session.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_DriveHDIcon))
+        btn_session.setIcon(get_ui_icon("session"))
+        btn_session.setIconSize(QSize(16, 16))
         btn_session.clicked.connect(self.save_current_session)
         toolbar.addWidget(btn_session)
 

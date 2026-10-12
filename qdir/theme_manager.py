@@ -97,6 +97,59 @@ def _parse_qt6ct_palette(color_scheme_path: str, app: QApplication) -> Optional[
     return pal if has_colors else None
 
 
+def _detect_system_icon_theme() -> Optional[str]:
+    """Detecta o tema de ícones configurado no GTK, gsettings ou temas instalados."""
+    # 1. Verifica configuração GTK 3 / 4
+    for gtk_path in ["~/.config/gtk-3.0/settings.ini", "~/.config/gtk-4.0/settings.ini"]:
+        fpath = os.path.expanduser(gtk_path)
+        if os.path.isfile(fpath):
+            try:
+                cp = configparser.ConfigParser()
+                cp.read(fpath)
+                theme = cp.get("Settings", "gtk-icon-theme-name", fallback="").strip().strip("\"'")
+                if theme:
+                    return theme
+            except Exception:
+                pass
+
+    # 2. Verifica gsettings
+    try:
+        import subprocess
+        res = subprocess.run(
+            ["gsettings", "get", "org.gnome.desktop.interface", "icon-theme"],
+            capture_output=True,
+            text=True,
+            timeout=1,
+        )
+        theme = res.stdout.strip().strip("'\"")
+        if theme and theme != "hicolor":
+            return theme
+    except Exception:
+        pass
+
+    # 3. Temas populares instalados no sistema
+    candidate_dirs = [
+        os.path.expanduser("~/.local/share/icons"),
+        os.path.expanduser("~/.icons"),
+        "/usr/share/icons",
+    ]
+    preferred = [
+        "Tela-dracula-dark",
+        "Tela-dark",
+        "Papirus-Dark",
+        "breeze-dark",
+        "breeze",
+        "Adwaita",
+        "Pop",
+    ]
+    for pref in preferred:
+        for cdir in candidate_dirs:
+            if os.path.isdir(os.path.join(cdir, pref)):
+                return pref
+
+    return None
+
+
 def apply_system_theme(app: QApplication) -> bool:
     """
     Detecta e aplica o tema configurado no Qt6 Settings (qt6ct), KDE ou sistema.
@@ -140,11 +193,17 @@ def apply_system_theme(app: QApplication) -> bool:
 
             # D. Tema de Ícones
             icon_theme = cp.get("Appearance", "icon_theme", fallback="").strip().strip("\"'")
+            if not icon_theme:
+                icon_theme = _detect_system_icon_theme()
             if icon_theme:
                 QIcon.setThemeName(icon_theme)
 
         except Exception as e:
             print(f"[QDir Theme] Erro ao processar qt6ct.conf: {e}", file=sys.stderr)
+    else:
+        icon_theme = _detect_system_icon_theme()
+        if icon_theme:
+            QIcon.setThemeName(icon_theme)
 
     # 2. Se nenhuma paleta personalizada foi aplicada, verifica modo escuro no sistema como fallback
     if not applied:
