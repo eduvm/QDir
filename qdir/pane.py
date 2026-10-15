@@ -7,11 +7,13 @@ coloração por regras e suporte a drag & drop entre painéis.
 
 import fnmatch
 import os
+import time
 from typing import List, Optional
 
 from PyQt6.QtCore import (
     QDir,
     QItemSelection,
+    QItemSelectionModel,
     QModelIndex,
     QPoint,
     QSize,
@@ -61,11 +63,65 @@ from qdir.file_ops import (
     BatchRenameDialog,
     copy_or_move_items,
     delete_items_permanently,
+    extract_archive,
+    get_archive_base_name,
+    is_archive_file,
     open_file_default,
     open_in_terminal,
     trash_items,
 )
 from qdir.mime_manager import MimeManager
+
+
+def is_accessible_dir(path: str) -> bool:
+    """Verifica se o caminho existe, é diretório e possui permissão de leitura e acesso."""
+    try:
+        if not path or not os.path.exists(path) or not os.path.isdir(path):
+            return False
+        if not os.access(path, os.R_OK | os.X_OK):
+            return False
+        os.listdir(path)
+        return True
+    except (PermissionError, OSError):
+        return False
+
+
+def find_accessible_ancestor(start_path: str, boundary_root: Optional[str] = None) -> Optional[str]:
+    """
+    Percorre a hierarquia de diretórios para cima a partir de start_path procurando
+    o primeiro diretório pai que realmente exista e seja acessível no disco.
+    
+    Se boundary_root for fornecido e ainda existir no disco, a busca não sobe além dele.
+    """
+    if not start_path:
+        return None
+
+    current = os.path.abspath(os.path.expanduser(start_path))
+    boundary_norm = os.path.realpath(boundary_root) if (boundary_root and os.path.exists(boundary_root)) else None
+
+    while True:
+        parent = os.path.dirname(current)
+        # Se chegou na raiz ('/' ou drive) e não há mais pai acima
+        if not parent or parent == current:
+            if is_accessible_dir(parent) and os.path.realpath(parent) != os.path.realpath(start_path):
+                return parent
+            return None
+
+        # Respeita o boundary_root se a raiz bloqueada ainda existir
+        if boundary_norm:
+            norm_parent = os.path.realpath(parent)
+            try:
+                if norm_parent != boundary_norm and os.path.commonpath([norm_parent, boundary_norm]) != boundary_norm:
+                    if is_accessible_dir(boundary_norm):
+                        return boundary_root
+                    return None
+            except ValueError:
+                return None
+
+        if is_accessible_dir(parent):
+            return parent
+
+        current = parent
 
 
 class QDirFilterProxyModel(QSortFilterProxyModel):
@@ -324,6 +380,7 @@ class FileTableView(QTableView):
     def __init__(self, pane: "QDirPane", parent=None):
         super().__init__(parent)
         self.pane = pane
+        self._last_rename_time: float = 0.0
         self.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -350,6 +407,32 @@ class FileTableView(QTableView):
         self.setColumnWidth(2, 100)
         self.setColumnWidth(3, 140)
         self.doubleClicked.connect(self.on_double_click)
+
+    def is_editing(self) -> bool:
+        if self.state() == QAbstractItemView.State.EditingState:
+            return True
+        from qdir.color_engine import RenameLineEdit
+        editor = self.viewport().findChild(RenameLineEdit)
+        return editor is not None and editor.isVisible()
+
+    def select_and_scroll_to_path(self, path: str, retries: int = 8):
+        if not hasattr(self, "pane") or not self.pane:
+            return
+        pane = self.pane
+        src_idx = pane.fs_model.index(path)
+        if src_idx.isValid():
+            proxy_idx = pane.proxy_model.mapFromSource(src_idx)
+            if proxy_idx.isValid():
+                name_idx = proxy_idx.siblingAtColumn(0)
+                self.setCurrentIndex(name_idx)
+                self.selectionModel().select(
+                    name_idx,
+                    QItemSelectionModel.SelectionFlag.ClearAndSelect | QItemSelectionModel.SelectionFlag.Rows
+                )
+                self.scrollTo(name_idx, QAbstractItemView.ScrollHint.EnsureVisible)
+                return
+        if retries > 0:
+            QTimer.singleShot(40, lambda: self.select_and_scroll_to_path(path, retries - 1))
 
     def mouseDoubleClickEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
@@ -419,10 +502,21 @@ class FileTableView(QTableView):
         self.edit(name_idx)
 
     def mousePressEvent(self, event):
+        if hasattr(self, "pane") and self.pane:
+            self.pane._pending_scroll_to_top = False
         super().mousePressEvent(event)
         self.pane_focused.emit()
 
+    def wheelEvent(self, event):
+        if hasattr(self, "pane") and self.pane:
+            self.pane._pending_scroll_to_top = False
+        super().wheelEvent(event)
+
     def keyPressEvent(self, event):
+        if self.is_editing():
+            super().keyPressEvent(event)
+            return
+
         key = event.key()
         modifiers = event.modifiers()
         ctrl = bool(modifiers & Qt.KeyboardModifier.ControlModifier)
@@ -453,6 +547,10 @@ class FileTableView(QTableView):
             return
 
         elif key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            if time.time() - getattr(self, "_last_rename_time", 0.0) < 0.35:
+                event.accept()
+                return
+
             selected = self.selectionModel().selectedRows()
             if selected:
                 self.on_double_click(selected[0])
@@ -604,6 +702,7 @@ class QDirPane(QFrame):
         self.history_index: int = 0
         self.is_active: bool = False
         self.tree_width: int = 180
+        self._pending_scroll_to_top: bool = True
 
         # Configuração visual do Frame do Painel
         self.setFrameShape(QFrame.Shape.StyledPanel)
@@ -800,20 +899,37 @@ class QDirPane(QFrame):
 
     def set_active(self, active: bool):
         self.is_active = active
+        app = QApplication.instance()
+        pal = app.palette() if app else self.palette()
+        hl = pal.color(pal.ColorRole.Highlight).name()
+        hl_txt = pal.color(pal.ColorRole.HighlightedText).name()
+        win_txt = pal.color(pal.ColorRole.WindowText).name()
         if active:
             self.setStyleSheet(
-                f"#QDirPane_{self.pane_id} {{ border: 2px solid palette(highlight); border-radius: 4px; }}"
+                f"#QDirPane_{self.pane_id} {{ border: 2px solid {hl}; border-radius: 4px; }}"
             )
             self.lbl_id.setStyleSheet(
-                "font-weight: bold; color: palette(highlighted-text); background-color: palette(highlight); border-radius: 3px; padding: 1px 6px;"
+                f"font-weight: bold; color: {hl_txt}; background-color: {hl}; border-radius: 3px; padding: 1px 6px;"
             )
         else:
             self.setStyleSheet(
                 f"#QDirPane_{self.pane_id} {{ border: 2px solid rgba(128, 128, 128, 0.35); border-radius: 4px; }}"
             )
             self.lbl_id.setStyleSheet(
-                "font-weight: normal; color: palette(window-text); background-color: rgba(128, 128, 128, 0.15); border-radius: 3px; padding: 1px 6px;"
+                f"font-weight: normal; color: {win_txt}; background-color: rgba(128, 128, 128, 0.15); border-radius: 3px; padding: 1px 6px;"
             )
+
+    def refresh_theme(self):
+        """Atualiza bordas, badges, ícones vetoriais e viewports após troca de tema em tempo real."""
+        self.set_active(self.is_active)
+        self.btn_back.setIcon(get_ui_icon("back"))
+        self.btn_fwd.setIcon(get_ui_icon("fwd"))
+        self.btn_up.setIcon(get_ui_icon("up"))
+        self.btn_refresh.setIcon(get_ui_icon("refresh"))
+        self.btn_term.setIcon(get_ui_icon("terminal"))
+        self.table_view.viewport().update()
+        self.tree_view.viewport().update()
+
 
     def navigate_to(self, path: str, record_history: bool = True):
         path = os.path.abspath(os.path.expanduser(path))
@@ -825,36 +941,44 @@ class QDirPane(QFrame):
             data = self.get_tab_data(cur_tab)
             root_path = data.get("root_path")
             if root_path:
-                norm_target = os.path.realpath(path)
-                norm_root = os.path.realpath(root_path)
-                is_sub = False
-                try:
-                    if norm_target == norm_root or os.path.commonpath([norm_target, norm_root]) == norm_root:
-                        is_sub = True
-                except ValueError:
+                if not os.path.exists(root_path):
+                    # Raiz da aba bloqueada foi excluída externamente! Desbloqueia a aba
+                    self.set_tab_locked(cur_tab, False)
+                else:
+                    norm_target = os.path.realpath(path)
+                    norm_root = os.path.realpath(root_path)
                     is_sub = False
+                    try:
+                        if norm_target == norm_root or os.path.commonpath([norm_target, norm_root]) == norm_root:
+                            is_sub = True
+                    except ValueError:
+                        is_sub = False
 
-                if not is_sub:
-                    # Fora da raiz bloqueada! Ignora completamente o comando.
-                    self.txt_path.setText(self.current_path)
-                    return
+                    if not is_sub:
+                        # Fora da raiz bloqueada! Ignora completamente o comando.
+                        self.txt_path.setText(self.current_path)
+                        return
 
+        is_new_dir = (os.path.realpath(path) != os.path.realpath(self.current_path))
         self.current_path = path
         self.txt_path.setText(path)
 
-        # Limpa seleção e índice corrente do diretório anterior
-        self.table_view.selectionModel().clear()
-        self.table_view.setCurrentIndex(QModelIndex())
+        if is_new_dir:
+            self._pending_scroll_to_top = True
+            # Limpa seleção e índice corrente do diretório anterior
+            self.table_view.selectionModel().clear()
+            self.table_view.setCurrentIndex(QModelIndex())
 
         src_index = self.fs_model.setRootPath(path)
         proxy_index = self.proxy_model.mapFromSource(src_index)
         self.table_view.setRootIndex(proxy_index)
 
-        # Garante rolagem para o início do topo imediatamente e em passagens assíncronas
-        self._reset_view_scroll_to_top()
-        QTimer.singleShot(0, self._reset_view_scroll_to_top)
-        QTimer.singleShot(50, self._reset_view_scroll_to_top)
-        QTimer.singleShot(150, self._reset_view_scroll_to_top)
+        if is_new_dir:
+            # Garante rolagem para o início do topo imediatamente e em passagens assíncronas
+            self._reset_view_scroll_to_top()
+            QTimer.singleShot(0, self._reset_view_scroll_to_top_if_pending)
+            QTimer.singleShot(50, self._reset_view_scroll_to_top_if_pending)
+            QTimer.singleShot(150, self._reset_view_scroll_to_top_if_pending)
 
         # Atualiza título e dados da aba corrente
         if cur_tab >= 0:
@@ -929,18 +1053,30 @@ class QDirPane(QFrame):
 
     def go_up(self):
         cur_tab = self.tabs.currentIndex()
+        root = None
         if cur_tab >= 0 and self.is_tab_locked(cur_tab):
             data = self.get_tab_data(cur_tab)
             root = data.get("root_path")
-            if root and os.path.realpath(self.current_path) == os.path.realpath(root):
-                return
-        parent_dir = os.path.dirname(self.current_path)
-        if parent_dir and parent_dir != self.current_path:
-            self.navigate_to(parent_dir)
+            if root and os.path.exists(root):
+                if os.path.realpath(self.current_path) == os.path.realpath(root):
+                    return
+            elif root and not os.path.exists(root):
+                # A raiz da aba bloqueada foi excluída externamente! Desfaz bloqueio
+                self.set_tab_locked(cur_tab, False)
+                root = None
+
+        target_parent = find_accessible_ancestor(self.current_path, boundary_root=root)
+        if target_parent and os.path.realpath(target_parent) != os.path.realpath(self.current_path):
+            self.navigate_to(target_parent)
 
     def refresh(self):
         self.fs_model.setRootPath("")
-        self.navigate_to(self.current_path, record_history=False)
+        target = self.current_path
+        if not is_accessible_dir(target):
+            ancestor = find_accessible_ancestor(target)
+            if ancestor:
+                target = ancestor
+        self.navigate_to(target, record_history=False)
 
     def _reset_view_scroll_to_top(self):
         self.table_view.verticalScrollBar().setValue(0)
@@ -952,8 +1088,13 @@ class QDirPane(QFrame):
             if not self.table_view.selectionModel().hasSelection():
                 self.table_view.setCurrentIndex(first_idx)
 
+    def _reset_view_scroll_to_top_if_pending(self):
+        if getattr(self, "_pending_scroll_to_top", False):
+            self._reset_view_scroll_to_top()
+
     def _on_directory_loaded(self, path: str):
-        if os.path.realpath(path) == os.path.realpath(self.current_path):
+        if getattr(self, "_pending_scroll_to_top", False) and os.path.realpath(path) == os.path.realpath(self.current_path):
+            self._pending_scroll_to_top = False
             self._reset_view_scroll_to_top()
 
     def on_path_entered(self):
@@ -1227,6 +1368,20 @@ class QDirPane(QFrame):
             act_choose = menu_open_with.addAction("Escolher outro aplicativo...")
             act_choose.triggered.connect(lambda checked=False, files=valid_files: self.open_with_dialog(files))
 
+        archive_files = [p for p in selected if is_archive_file(p)]
+        if archive_files:
+            menu.addSeparator()
+            icon_ext = get_ui_icon("extract")
+            act_extract_here = menu.addAction(icon_ext, "Extrair aqui")
+            act_extract_here.triggered.connect(lambda: self.extract_archives(archive_files, into_subfolder=False))
+
+            if len(archive_files) == 1:
+                base_folder = get_archive_base_name(archive_files[0])
+                act_extract_sub = menu.addAction(icon_ext, f"Extrair para '{base_folder}/'")
+            else:
+                act_extract_sub = menu.addAction(icon_ext, "Extrair cada um em sua respectiva pasta")
+            act_extract_sub.triggered.connect(lambda: self.extract_archives(archive_files, into_subfolder=True))
+
         act_term = menu.addAction("Abrir no Terminal")
         target_dir = selected[0] if (selected and os.path.isdir(selected[0])) else self.current_path
         act_term.triggered.connect(lambda: open_in_terminal(target_dir))
@@ -1325,6 +1480,42 @@ class QDirPane(QFrame):
             self.refresh()
 
         self.status_updated.emit(f"Painel #{self.pane_id}: {count} item(ns) {'movido(s)' if is_move else 'copiado(s)'} com sucesso.")
+
+    def extract_archives(self, archive_paths: List[str], into_subfolder: bool = False):
+        """Extrai arquivos compactados selecionados no diretório atual ou em subpastas correspondentes."""
+        if not archive_paths:
+            return
+
+        success_count = 0
+        errors = []
+
+        for arc in archive_paths:
+            if not os.path.isfile(arc):
+                continue
+
+            if into_subfolder:
+                folder_name = get_archive_base_name(arc)
+                dest = os.path.join(self.current_path, folder_name)
+            else:
+                dest = self.current_path
+
+            ok, err = extract_archive(arc, dest)
+            if ok:
+                success_count += 1
+            else:
+                errors.append(f"{os.path.basename(arc)}: {err}")
+
+        if errors:
+            QMessageBox.warning(self.window(), "Erros na Extração", "\n".join(errors))
+
+        if success_count > 0:
+            msg = (
+                f"Painel #{self.pane_id}: {success_count} arquivo(s) extraído(s) em subpastas com sucesso."
+                if into_subfolder
+                else f"Painel #{self.pane_id}: {success_count} arquivo(s) extraído(s) aqui com sucesso."
+            )
+            self.status_updated.emit(msg)
+            self.refresh()
 
     def rename_single(self):
         self.table_view.rename_current_inline()

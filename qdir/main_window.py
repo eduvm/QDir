@@ -11,6 +11,7 @@ from typing import List, Optional
 from PyQt6.QtCore import QDir, QSize, Qt, QTimer
 from PyQt6.QtGui import QAction, QActionGroup, QIcon, QKeySequence
 from PyQt6.QtWidgets import (
+    QApplication,
     QComboBox,
     QDialog,
     QFileDialog,
@@ -34,6 +35,7 @@ from qdir.file_ops import BatchRenameDialog, open_in_terminal
 from qdir.layout_manager import LayoutManager
 from qdir.pane import QDirPane
 from qdir.session_manager import SessionManager
+from qdir.theme_manager import WallpaperThemeWatcher, is_wallpaper_theme_enabled_in_settings
 
 
 from qdir.color_dialog import ColorRulesDialog
@@ -47,6 +49,7 @@ class QDirMainWindow(QMainWindow):
         super().__init__(parent)
         self.setWindowTitle("QDir Linux - Quad File Explorer")
         self.resize(1200, 800)
+        self.use_wallpaper_theme: bool = is_wallpaper_theme_enabled_in_settings()
 
         # 1. Carrega motor de cores (tenta Q-Dir.ini na pasta do projeto se existir)
         ini_path = os.path.join(os.path.dirname(__file__), "..", "Q-Dir Windows", "Q-Dir.ini")
@@ -84,6 +87,15 @@ class QDirMainWindow(QMainWindow):
 
         # 7. Sincroniza estado da área de transferência
         QDirClipboard.clipboard_changed.connect(self.on_clipboard_changed)
+
+        # 8. Monitora troca de Wallpaper (Pywal + OpenRGB) em tempo real
+        self.theme_watcher = WallpaperThemeWatcher(
+            QApplication.instance(),
+            on_theme_updated=self.on_theme_updated,
+            parent=self,
+        )
+        self.theme_watcher.enabled = self.use_wallpaper_theme
+
 
     def refresh_all_panes(self):
         """Atualiza a listagem de arquivos de todos os painéis."""
@@ -257,6 +269,13 @@ class QDirMainWindow(QMainWindow):
         self.act_maximize.setShortcuts([QKeySequence("Ctrl+M"), QKeySequence("F11")])
         self.act_maximize.triggered.connect(self.toggle_maximize_active_pane)
 
+        menu_view.addSeparator()
+
+        self.act_wallpaper_theme = menu_view.addAction("🎨 Tema Dinâmico do Wallpaper (Pywal / OpenRGB)")
+        self.act_wallpaper_theme.setCheckable(True)
+        self.act_wallpaper_theme.setChecked(self.use_wallpaper_theme)
+        self.act_wallpaper_theme.triggered.connect(self.toggle_wallpaper_theme)
+
         # --- Menu Favoritos ---
         menu_fav = menubar.addMenu("&Favoritos")
         act_add_fav = menu_fav.addAction("Adicionar Pasta Atual aos Favoritos")
@@ -279,6 +298,12 @@ class QDirMainWindow(QMainWindow):
         menu_tools = menubar.addMenu("Ferramen&tas")
         act_rules = menu_tools.addAction("Regras de Cores (Filter2)...")
         act_rules.triggered.connect(self.show_color_rules)
+
+        menu_tools.addSeparator()
+        self.act_wallpaper_theme_tools = menu_tools.addAction("🎨 Tema Dinâmico do Wallpaper (Pywal / OpenRGB)")
+        self.act_wallpaper_theme_tools.setCheckable(True)
+        self.act_wallpaper_theme_tools.setChecked(self.use_wallpaper_theme)
+        self.act_wallpaper_theme_tools.triggered.connect(self.toggle_wallpaper_theme)
 
         # --- Menu Ajuda ---
         menu_help = menubar.addMenu("A&juda")
@@ -318,34 +343,34 @@ class QDirMainWindow(QMainWindow):
         toolbar.addSeparator()
 
         # Botão Terminal
-        btn_term = QPushButton(" Terminal")
-        btn_term.setIcon(get_ui_icon("terminal"))
-        btn_term.setIconSize(QSize(16, 16))
-        btn_term.clicked.connect(lambda: open_in_terminal(self.active_pane.current_path))
-        toolbar.addWidget(btn_term)
+        self.btn_term = QPushButton(" Terminal")
+        self.btn_term.setIcon(get_ui_icon("terminal"))
+        self.btn_term.setIconSize(QSize(16, 16))
+        self.btn_term.clicked.connect(lambda: open_in_terminal(self.active_pane.current_path))
+        toolbar.addWidget(self.btn_term)
 
         # Botão Atualizar Todos
-        btn_refresh = QPushButton(" Atualizar")
-        btn_refresh.setIcon(get_ui_icon("refresh"))
-        btn_refresh.setIconSize(QSize(16, 16))
-        btn_refresh.clicked.connect(self.refresh_all_panes)
-        toolbar.addWidget(btn_refresh)
+        self.btn_refresh = QPushButton(" Atualizar")
+        self.btn_refresh.setIcon(get_ui_icon("refresh"))
+        self.btn_refresh.setIconSize(QSize(16, 16))
+        self.btn_refresh.clicked.connect(self.refresh_all_panes)
+        toolbar.addWidget(self.btn_refresh)
 
         # Botão Exportar
-        btn_export = QPushButton(" Exportar...")
-        btn_export.setIcon(get_ui_icon("export"))
-        btn_export.setIconSize(QSize(16, 16))
-        btn_export.clicked.connect(lambda: self.export_active_dir("html"))
-        toolbar.addWidget(btn_export)
+        self.btn_export = QPushButton(" Exportar...")
+        self.btn_export.setIcon(get_ui_icon("export"))
+        self.btn_export.setIconSize(QSize(16, 16))
+        self.btn_export.clicked.connect(lambda: self.export_active_dir("html"))
+        toolbar.addWidget(self.btn_export)
 
         toolbar.addSeparator()
 
         # Botão Salvar Sessão
-        btn_session = QPushButton(" Salvar Sessão")
-        btn_session.setIcon(get_ui_icon("session"))
-        btn_session.setIconSize(QSize(16, 16))
-        btn_session.clicked.connect(self.save_current_session)
-        toolbar.addWidget(btn_session)
+        self.btn_session = QPushButton(" Salvar Sessão")
+        self.btn_session.setIcon(get_ui_icon("session"))
+        self.btn_session.setIconSize(QSize(16, 16))
+        self.btn_session.clicked.connect(self.save_current_session)
+        toolbar.addWidget(self.btn_session)
 
     def _build_status_bar(self):
         status = QStatusBar()
@@ -394,6 +419,37 @@ class QDirMainWindow(QMainWindow):
         active_idx = self.panes.index(self.active_pane) if self.active_pane in self.panes else 0
         self.on_pane_maximize_requested(active_idx)
 
+    def toggle_wallpaper_theme(self, checked: bool):
+        """Ativa ou desativa a sincronização de cores com o Wallpaper (Pywal + OpenRGB) em tempo real."""
+        self.use_wallpaper_theme = bool(checked)
+        if hasattr(self, "act_wallpaper_theme"):
+            self.act_wallpaper_theme.blockSignals(True)
+            self.act_wallpaper_theme.setChecked(self.use_wallpaper_theme)
+            self.act_wallpaper_theme.blockSignals(False)
+        if hasattr(self, "act_wallpaper_theme_tools"):
+            self.act_wallpaper_theme_tools.blockSignals(True)
+            self.act_wallpaper_theme_tools.setChecked(self.use_wallpaper_theme)
+            self.act_wallpaper_theme_tools.blockSignals(False)
+        self.save_settings()
+        if hasattr(self, "theme_watcher"):
+            self.theme_watcher.set_enabled(self.use_wallpaper_theme)
+
+    def on_theme_updated(self):
+        """Callback disparado quando a paleta do Wallpaper (ou alternância para qt6ct) é aplicada."""
+        for p in self.panes:
+            p.refresh_theme()
+        if hasattr(self, "btn_term"):
+            self.btn_term.setIcon(get_ui_icon("terminal"))
+        if hasattr(self, "btn_refresh"):
+            self.btn_refresh.setIcon(get_ui_icon("refresh"))
+        if hasattr(self, "btn_export"):
+            self.btn_export.setIcon(get_ui_icon("export"))
+        if hasattr(self, "btn_session"):
+            self.btn_session.setIcon(get_ui_icon("session"))
+        if hasattr(self, "layout_manager") and hasattr(self.layout_manager, "shared_tree"):
+            self.layout_manager.shared_tree.viewport().update()
+        self.update()
+
     def toggle_all_hidden(self, checked: bool):
         for pane in self.panes:
             pane.chk_hidden.setChecked(checked)
@@ -402,6 +458,7 @@ class QDirMainWindow(QMainWindow):
         for pane in self.panes:
             pane.refresh()
         self.update_status_bar()
+
 
     def open_batch_rename(self):
         selected = self.active_pane.get_selected_paths()
@@ -541,6 +598,7 @@ class QDirMainWindow(QMainWindow):
                 "window_width": self.width(),
                 "window_height": self.height(),
                 "is_maximized": self.isMaximized(),
+                "use_wallpaper_theme": self.use_wallpaper_theme,
                 "panes": panes_data,
             }
             import json
@@ -558,6 +616,13 @@ class QDirMainWindow(QMainWindow):
                 with open(cfg_path, "r", encoding="utf-8") as f:
                     data = json.load(f)
 
+                if "use_wallpaper_theme" in data:
+                    self.use_wallpaper_theme = bool(data["use_wallpaper_theme"])
+                    if hasattr(self, "act_wallpaper_theme"):
+                        self.act_wallpaper_theme.setChecked(self.use_wallpaper_theme)
+                    if hasattr(self, "act_wallpaper_theme_tools"):
+                        self.act_wallpaper_theme_tools.setChecked(self.use_wallpaper_theme)
+
                 if data.get("is_maximized"):
                     self.showMaximized()
                 elif "window_width" in data and "window_height" in data:
@@ -565,6 +630,7 @@ class QDirMainWindow(QMainWindow):
 
                 if "shared_tree_width" in data:
                     self.layout_manager.set_shared_tree_width(int(data["shared_tree_width"]))
+
 
                 layout_id = data.get("layout_id", 0)
                 self.switch_layout(layout_id)

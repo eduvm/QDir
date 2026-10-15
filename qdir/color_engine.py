@@ -302,12 +302,34 @@ class QDirColorDelegate(QStyledItemDelegate):
         else:
             super().setEditorData(editor, index)
 
+    def destroyEditor(self, editor: QWidget, index: QModelIndex):
+        import time
+        table = self.parent()
+        if table and hasattr(table, "_last_rename_time"):
+            table._last_rename_time = time.time()
+        super().destroyEditor(editor, index)
+
     def setModelData(self, editor: QWidget, model, index: QModelIndex):
+        import time
+        table = self.parent()
+        if table and hasattr(table, "_last_rename_time"):
+            table._last_rename_time = time.time()
+
         if isinstance(editor, RenameLineEdit):
             new_text = editor.text().strip()
             old_text = model.data(index, Qt.ItemDataRole.EditRole) or model.data(index, Qt.ItemDataRole.DisplayRole)
             if new_text and new_text != old_text:
+                src_index = model.mapToSource(index) if hasattr(model, "mapToSource") else index
+                fs_model = model.sourceModel() if hasattr(model, "sourceModel") else model
+                parent_dir = ""
+                if hasattr(fs_model, "filePath") and src_index.isValid():
+                    parent_dir = fs_model.filePath(src_index.parent())
+
                 model.setData(index, new_text, Qt.ItemDataRole.EditRole)
+
+                if parent_dir and hasattr(table, "select_and_scroll_to_path"):
+                    new_full_path = os.path.join(parent_dir, new_text)
+                    table.select_and_scroll_to_path(new_full_path)
         else:
             super().setModelData(editor, model, index)
 
@@ -395,6 +417,13 @@ class RenameLineEdit(QLineEdit):
             self.navigate_requested.emit(-1)
             event.accept()
             return
+        elif key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            import time
+            w = self.parent()
+            while w is not None and not hasattr(w, "_last_rename_time") and w.parent():
+                w = w.parent()
+            if w is not None and hasattr(w, "_last_rename_time"):
+                w._last_rename_time = time.time()
         super().keyPressEvent(event)
 
 

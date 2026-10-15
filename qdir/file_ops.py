@@ -467,3 +467,162 @@ class BatchRenameDialog(QDialog):
         if errors:
             QMessageBox.warning(self, "Erros na Renomeação", "\n".join(errors))
         self.accept()
+
+
+# =========================================================================
+# Operações com Arquivos Compactados (Zip, Rar, 7z, Tar, etc.)
+# =========================================================================
+
+ARCHIVE_EXTENSIONS = (
+    ".zip",
+    ".rar",
+    ".7z",
+    ".tar",
+    ".tar.gz",
+    ".tgz",
+    ".tar.bz2",
+    ".tbz2",
+    ".tar.xz",
+    ".txz",
+    ".gz",
+    ".bz2",
+    ".xz",
+)
+
+
+def is_archive_file(filepath: str) -> bool:
+    """Verifica se o arquivo selecionado é um arquivo compactado suportado."""
+    if not filepath or not os.path.isfile(filepath):
+        return False
+    lower = filepath.lower()
+    return any(lower.endswith(ext) for ext in ARCHIVE_EXTENSIONS)
+
+
+def get_archive_base_name(filepath: str) -> str:
+    """Retorna o nome base do arquivo sem as extensões de compactação (ex: 'backup.tar.gz' -> 'backup')."""
+    base = os.path.basename(filepath)
+    lower = base.lower()
+    for ext in (
+        ".tar.gz", ".tar.bz2", ".tar.xz",
+        ".tgz", ".tbz2", ".txz",
+        ".zip", ".rar", ".7z", ".tar",
+        ".gz", ".bz2", ".xz",
+    ):
+        if lower.endswith(ext):
+            return base[:-len(ext)]
+    name, _ = os.path.splitext(base)
+    return name
+
+
+def extract_archive(archive_path: str, dest_dir: str) -> Tuple[bool, str]:
+    """
+    Extrai o arquivo compactado para dest_dir.
+    Suporta .zip, .rar, .7z, .tar, .tar.gz, .tgz, .tar.bz2, .tbz2, .tar.xz, .txz, .gz, .bz2, .xz.
+    """
+    if not os.path.isfile(archive_path):
+        return False, f"Arquivo compactado não encontrado: {archive_path}"
+
+    try:
+        os.makedirs(dest_dir, exist_ok=True)
+    except Exception as e:
+        return False, f"Falha ao criar diretório de destino: {str(e)}"
+
+    lower = archive_path.lower()
+    has_7z = bool(shutil.which("7z"))
+
+    # 1. Arquivos RAR ou 7Z usando utilitário de sistema
+    if lower.endswith(".rar") or lower.endswith(".7z"):
+        if has_7z:
+            cmd = ["7z", "x", "-y", f"-o{dest_dir}", archive_path]
+            res = subprocess.run(cmd, capture_output=True, text=True)
+            if res.returncode == 0:
+                return True, ""
+            err_msg = res.stderr.strip() or res.stdout.strip()
+            return False, f"Falha ao extrair com 7z (código {res.returncode}): {err_msg}"
+        if lower.endswith(".rar") and shutil.which("unrar"):
+            cmd = ["unrar", "x", "-o+", "-y", archive_path, f"{dest_dir}/"]
+            res = subprocess.run(cmd, capture_output=True, text=True)
+            if res.returncode in (0, 1):
+                return True, ""
+            return False, f"Falha ao extrair com unrar: {res.stderr.strip()}"
+        return False, "Para extrair arquivos deste formato, instale o pacote p7zip (7z) ou unrar no sistema."
+
+    # 2. Formato ZIP (Python nativo zipfile com fallback)
+    if lower.endswith(".zip"):
+        try:
+            import zipfile
+            with zipfile.ZipFile(archive_path, "r") as zf:
+                dest_resolved = os.path.realpath(dest_dir)
+                for member in zf.infolist():
+                    target_path = os.path.realpath(os.path.join(dest_dir, member.filename))
+                    if not target_path.startswith(dest_resolved + os.sep) and target_path != dest_resolved:
+                        continue
+                    zf.extract(member, dest_dir)
+            return True, ""
+        except Exception as e:
+            if has_7z:
+                res = subprocess.run(["7z", "x", "-y", f"-o{dest_dir}", archive_path], capture_output=True, text=True)
+                if res.returncode == 0:
+                    return True, ""
+            if shutil.which("unzip"):
+                res = subprocess.run(["unzip", "-o", "-q", archive_path, "-d", dest_dir], capture_output=True, text=True)
+                if res.returncode == 0:
+                    return True, ""
+            return False, f"Erro ao extrair zip: {str(e)}"
+
+    # 3. Formato TAR (*.tar, *.tar.gz, *.tgz, *.tar.bz2, *.tbz2, *.tar.xz, *.txz)
+    if any(lower.endswith(ext) for ext in (".tar", ".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".tar.xz", ".txz")):
+        try:
+            import tarfile
+            with tarfile.open(archive_path, "r:*") as tf:
+                if hasattr(tarfile, "data_filter"):
+                    tf.extractall(dest_dir, filter="data")
+                else:
+                    dest_resolved = os.path.realpath(dest_dir)
+                    for member in tf.getmembers():
+                        target_path = os.path.realpath(os.path.join(dest_dir, member.name))
+                        if not target_path.startswith(dest_resolved + os.sep) and target_path != dest_resolved:
+                            continue
+                        tf.extract(member, dest_dir)
+            return True, ""
+        except Exception as e:
+            if has_7z:
+                res = subprocess.run(["7z", "x", "-y", f"-o{dest_dir}", archive_path], capture_output=True, text=True)
+                if res.returncode == 0:
+                    return True, ""
+            if shutil.which("tar"):
+                res = subprocess.run(["tar", "-xf", archive_path, "-C", dest_dir], capture_output=True, text=True)
+                if res.returncode == 0:
+                    return True, ""
+            return False, f"Erro ao extrair tar: {str(e)}"
+
+    # 4. Arquivos comprimidos simples (.gz, .bz2, .xz)
+    if any(lower.endswith(ext) for ext in (".gz", ".bz2", ".xz")):
+        base_out = get_archive_base_name(archive_path)
+        target_out = os.path.join(dest_dir, base_out)
+        try:
+            if lower.endswith(".gz"):
+                import gzip
+                with gzip.open(archive_path, "rb") as f_in, open(target_out, "wb") as f_out:
+                    shutil.copyfileobj(f_in, f_out)
+                return True, ""
+            elif lower.endswith(".bz2"):
+                import bz2
+                with bz2.open(archive_path, "rb") as f_in, open(target_out, "wb") as f_out:
+                    shutil.copyfileobj(f_in, f_out)
+                return True, ""
+            elif lower.endswith(".xz"):
+                import lzma
+                with lzma.open(archive_path, "rb") as f_in, open(target_out, "wb") as f_out:
+                    shutil.copyfileobj(f_in, f_out)
+                return True, ""
+        except Exception as e:
+            return False, f"Erro ao descompactar: {str(e)}"
+
+    # 5. Fallback via shutil.unpack_archive
+    try:
+        shutil.unpack_archive(archive_path, dest_dir)
+        return True, ""
+    except Exception as e:
+        return False, f"Falha na descompactação: {str(e)}"
+

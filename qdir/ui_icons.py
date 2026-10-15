@@ -128,6 +128,19 @@ def get_ui_icon(icon_name: str, color: Optional[Union[QColor, str]] = None, size
         p.fillRect(QRectF(w * 0.35, h * 0.2, w * 0.3, h * 0.25), base_color)
         p.drawRect(QRectF(w * 0.3, h * 0.55, w * 0.4, h * 0.25))
 
+    elif icon_name in ("extract", "unzip", "archive_extract"):
+        pen.setWidthF(1.8)
+        p.setPen(pen)
+        # Caixa / pasta base
+        p.drawRoundedRect(QRectF(w * 0.18, h * 0.38, w * 0.64, h * 0.46), 2, 2)
+        # Seta de extração saindo para cima
+        p.drawLine(QPointF(w * 0.5, h * 0.62), QPointF(w * 0.5, h * 0.14))
+        path = QPainterPath()
+        path.moveTo(w * 0.32, h * 0.28)
+        path.lineTo(w * 0.5, h * 0.12)
+        path.lineTo(w * 0.68, h * 0.28)
+        p.drawPath(path)
+
     p.end()
 
     # Monta o QIcon com estado Normal e Disabled (com opacidade balanceada)
