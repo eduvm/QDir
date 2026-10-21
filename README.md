@@ -26,6 +26,7 @@ Gerenciador de arquivos multilocular projetado para agilizar o fluxo de trabalho
   - **Feedback visual com cursores dedicados:** exibe cursores de arrasto idênticos aos do Double Commander (cursor com sinal `+` para Cópia e cursor com seta de movimento para Mover), alternando dinamicamente ao pressionar ou soltar `Ctrl`.
   - Arrastar e soltar arquivos entre painéis, sobre pastas filhas e sobre abas (com alternância automática de aba no hover).
   - Suporte completo a `Ctrl+C`, `Ctrl+X` (com atenuação visual translúcida de arquivos recortados) e `Ctrl+V` seguindo o padrão FreeDesktop / GNOME.
+  - **Transferência Assíncrona com Barra de Progresso:** diálogo com processamento em segundo plano (`QThread`) para arquivos e pastas, exibindo porcentagem de bytes transferidos, velocidade em tempo real (MB/s), tempo estimado (ETA) e cancelamento seguro com limpeza de arquivos parciais.
 - **Navegação Inteligente & Abertura de Arquivos:**
   - Reset automático de scroll ao entrar em pastas: a visualização sempre abre no topo absoluto da lista (iniciando no `..`), sem retenção residual de rolagem de pastas anteriores.
   - Entrada fixa `..` no topo para retornar à pasta pai (via `Enter` ou duplo clique).

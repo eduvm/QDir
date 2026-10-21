@@ -125,5 +125,70 @@ class TestTabLocking(unittest.TestCase):
         win.deleteLater()
         win2.deleteLater()
 
+    def test_locked_tab_external_symlink_navigation(self):
+        """
+        Valida que links simbólicos apontando para diretórios fora da raiz bloqueada
+        (ex: em outro disco) e seus subdiretórios podem ser navegados normalmente,
+        enquanto a subida além da raiz e acessos fora do link continuam bloqueados.
+        """
+        # Cria diretório externo (simulando outro disco/pasta fora da raiz bloqueada)
+        ext_disk = tempfile.mkdtemp(prefix="qdir_ext_disk_")
+        try:
+            ext_models = os.path.join(ext_disk, "models_ext")
+            ext_sub = os.path.join(ext_models, "sub_layer")
+            os.makedirs(ext_sub, exist_ok=True)
+
+            # Cria link simbólico dentro de self.test_dir apontando para ext_models
+            symlink_path = os.path.join(self.test_dir, "symlink_models")
+            os.symlink(ext_models, symlink_path)
+
+            # 1. Bloqueia aba na pasta raiz
+            self.pane.set_tab_locked(0, True)
+            self.assertTrue(self.pane.is_tab_locked(0))
+            base_name = os.path.basename(self.test_dir)
+
+            # 2. Navega para dentro do link simbólico
+            self.pane.navigate_to(symlink_path)
+            self.assertEqual(os.path.abspath(self.pane.current_path), os.path.abspath(symlink_path))
+            self.assertEqual(self.pane.tabs.tabText(0), f"🔒 {base_name}")
+
+            # 3. Navega para subdiretório dentro do link simbólico
+            sub_in_symlink = os.path.join(symlink_path, "sub_layer")
+            self.pane.navigate_to(sub_in_symlink)
+            self.assertEqual(os.path.abspath(self.pane.current_path), os.path.abspath(sub_in_symlink))
+
+            # 4. Sobe (go_up) um nível: deve ir para a pasta do link simbólico
+            self.pane.go_up()
+            self.assertEqual(os.path.abspath(self.pane.current_path), os.path.abspath(symlink_path))
+
+            # 5. Sobe (go_up) mais um nível: deve voltar para a raiz bloqueada
+            self.pane.go_up()
+            self.assertEqual(os.path.abspath(self.pane.current_path), os.path.abspath(self.test_dir))
+
+            # 6. Tenta subir além da raiz bloqueada: deve permanecer na raiz bloqueada
+            self.pane.go_up()
+            self.assertEqual(os.path.abspath(self.pane.current_path), os.path.abspath(self.test_dir))
+
+            # 7. Tenta navegar diretamente para pasta externa não vinculada: deve ignorar
+            unlinked_dir = tempfile.mkdtemp(prefix="qdir_unlinked_")
+            try:
+                self.pane.navigate_to(unlinked_dir)
+                self.assertEqual(os.path.abspath(self.pane.current_path), os.path.abspath(self.test_dir))
+            finally:
+                shutil.rmtree(unlinked_dir, ignore_errors=True)
+
+            # 8. Navegação pelo caminho físico do link deve ser traduzida para o caminho lógico
+            self.pane.navigate_to(ext_sub)
+            self.assertEqual(os.path.abspath(self.pane.current_path), os.path.abspath(sub_in_symlink))
+
+            # 9. Teste de histórico (Voltar e Avançar)
+            self.pane.go_back()
+            self.assertEqual(os.path.abspath(self.pane.current_path), os.path.abspath(self.test_dir))
+            self.pane.go_forward()
+            self.assertEqual(os.path.abspath(self.pane.current_path), os.path.abspath(sub_in_symlink))
+
+        finally:
+            shutil.rmtree(ext_disk, ignore_errors=True)
+
 if __name__ == "__main__":
     unittest.main()

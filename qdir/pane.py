@@ -12,10 +12,13 @@ from typing import List, Optional
 
 from PyQt6.QtCore import (
     QDir,
+    QEvent,
     QItemSelection,
     QItemSelectionModel,
     QModelIndex,
+    QObject,
     QPoint,
+    QRectF,
     QSize,
     QSortFilterProxyModel,
     Qt,
@@ -25,11 +28,17 @@ from PyQt6.QtCore import (
 )
 from PyQt6.QtGui import (
     QAction,
+    QBrush,
     QColor,
+    QCursor,
     QDrag,
     QFileSystemModel,
+    QFontMetrics,
     QIcon,
     QKeySequence,
+    QPainter,
+    QPen,
+    QPixmap,
 )
 from PyQt6.QtWidgets import (
     QAbstractItemView,
@@ -86,6 +95,65 @@ def is_accessible_dir(path: str) -> bool:
         return False
 
 
+def resolve_symlink_alias_under_root(path: str, root_path: str) -> Optional[str]:
+    """
+    Se path for um caminho físico real correspondente ao destino de um link simbólico
+    existente sob a raiz da aba bloqueada (ou subdiretórios sob ela), traduz para o caminho lógico correspondente.
+    """
+    if not path or not root_path or not os.path.exists(root_path):
+        return None
+    try:
+        norm_target = os.path.realpath(path)
+        for dirpath, dirnames, _ in os.walk(root_path, followlinks=False):
+            for d in list(dirnames):
+                full_d = os.path.join(dirpath, d)
+                if os.path.islink(full_d):
+                    link_target_norm = os.path.realpath(full_d)
+                    if norm_target == link_target_norm or norm_target.startswith(link_target_norm + os.sep):
+                        rel = os.path.relpath(norm_target, link_target_norm)
+                        return full_d if rel == "." else os.path.join(full_d, rel)
+            rel_depth = os.path.relpath(dirpath, root_path).count(os.sep)
+            if rel_depth >= 2:
+                dirnames.clear()
+    except (ValueError, OSError):
+        pass
+    return None
+
+
+def is_subpath_or_allowed_symlink(target_path: str, root_path: str) -> bool:
+    """
+    Verifica se target_path é um caminho permitido dentro de uma aba bloqueada em root_path.
+    Permite subdiretórios físicos (realpath) e também diretórios acessados através de
+    links simbólicos posicionados dentro da árvore de root_path e seus subdiretórios lógicos.
+    """
+    if not target_path or not root_path:
+        return False
+
+    # 1. Checagem física canônica (realpath)
+    try:
+        norm_target = os.path.realpath(target_path)
+        norm_root = os.path.realpath(root_path)
+        if norm_target == norm_root or os.path.commonpath([norm_target, norm_root]) == norm_root:
+            return True
+    except (ValueError, OSError):
+        pass
+
+    # 2. Checagem lógica (quando o caminho é descendente sob a raiz via symlink)
+    try:
+        logical_target = os.path.abspath(os.path.expanduser(target_path))
+        logical_root = os.path.abspath(os.path.expanduser(root_path))
+        if logical_target == logical_root or os.path.commonpath([logical_target, logical_root]) == logical_root:
+            return True
+    except (ValueError, OSError):
+        pass
+
+    # 3. Checagem se target_path é um caminho físico correspondente a um link simbólico sob root_path
+    if resolve_symlink_alias_under_root(target_path, root_path) is not None:
+        return True
+
+    return False
+
+
 def find_accessible_ancestor(start_path: str, boundary_root: Optional[str] = None) -> Optional[str]:
     """
     Percorre a hierarquia de diretórios para cima a partir de start_path procurando
@@ -97,25 +165,20 @@ def find_accessible_ancestor(start_path: str, boundary_root: Optional[str] = Non
         return None
 
     current = os.path.abspath(os.path.expanduser(start_path))
-    boundary_norm = os.path.realpath(boundary_root) if (boundary_root and os.path.exists(boundary_root)) else None
 
     while True:
         parent = os.path.dirname(current)
         # Se chegou na raiz ('/' ou drive) e não há mais pai acima
         if not parent or parent == current:
-            if is_accessible_dir(parent) and os.path.realpath(parent) != os.path.realpath(start_path):
+            if is_accessible_dir(parent) and os.path.realpath(parent) != os.path.realpath(start_path) and os.path.abspath(parent) != os.path.abspath(start_path):
                 return parent
             return None
 
         # Respeita o boundary_root se a raiz bloqueada ainda existir
-        if boundary_norm:
-            norm_parent = os.path.realpath(parent)
-            try:
-                if norm_parent != boundary_norm and os.path.commonpath([norm_parent, boundary_norm]) != boundary_norm:
-                    if is_accessible_dir(boundary_norm):
-                        return boundary_root
-                    return None
-            except ValueError:
+        if boundary_root and os.path.exists(boundary_root):
+            if not is_subpath_or_allowed_symlink(parent, boundary_root):
+                if is_accessible_dir(boundary_root):
+                    return boundary_root
                 return None
 
         if is_accessible_dir(parent):
@@ -311,11 +374,17 @@ class DroppableTabBar(QTabBar):
 
     def dragEnterEvent(self, event):
         if event.mimeData().hasUrls():
-            mods = QApplication.keyboardModifiers()
-            if mods & Qt.KeyboardModifier.ControlModifier:
+            mods = event.modifiers() | QApplication.keyboardModifiers()
+            is_move = bool(mods & Qt.KeyboardModifier.ShiftModifier)
+            if is_move:
                 event.setDropAction(Qt.DropAction.MoveAction)
             else:
                 event.setDropAction(Qt.DropAction.CopyAction)
+            copy_pm = get_drag_cursor_pixmap("copy")
+            move_pm = get_drag_cursor_pixmap("move")
+            c_target = QCursor(move_pm, 0, 0) if is_move else QCursor(copy_pm, 0, 0)
+            if QApplication.overrideCursor() is not None:
+                QApplication.changeOverrideCursor(c_target)
             event.accept()
         else:
             super().dragEnterEvent(event)
@@ -332,11 +401,17 @@ class DroppableTabBar(QTabBar):
                 self._hover_timer.stop()
                 self._hover_tab_idx = -1
 
-            mods = QApplication.keyboardModifiers()
-            if mods & Qt.KeyboardModifier.ControlModifier:
+            mods = event.modifiers() | QApplication.keyboardModifiers()
+            is_move = bool(mods & Qt.KeyboardModifier.ShiftModifier)
+            if is_move:
                 event.setDropAction(Qt.DropAction.MoveAction)
             else:
                 event.setDropAction(Qt.DropAction.CopyAction)
+            copy_pm = get_drag_cursor_pixmap("copy")
+            move_pm = get_drag_cursor_pixmap("move")
+            c_target = QCursor(move_pm, 0, 0) if is_move else QCursor(copy_pm, 0, 0)
+            if QApplication.overrideCursor() is not None:
+                QApplication.changeOverrideCursor(c_target)
             event.accept()
         else:
             super().dragMoveEvent(event)
@@ -349,6 +424,8 @@ class DroppableTabBar(QTabBar):
     def dropEvent(self, event):
         self._hover_timer.stop()
         self._hover_tab_idx = -1
+        while QApplication.overrideCursor() is not None:
+            QApplication.restoreOverrideCursor()
         if event.mimeData().hasUrls():
             pos = event.position().toPoint()
             tab_idx = self.tabAt(pos)
@@ -360,15 +437,37 @@ class DroppableTabBar(QTabBar):
 
             urls = event.mimeData().urls()
             paths = [u.toLocalFile() for u in urls if u.isLocalFile()]
-            mods = QApplication.keyboardModifiers()
-            is_move = bool(mods & Qt.KeyboardModifier.ControlModifier) or (
+            mods = event.modifiers() | QApplication.keyboardModifiers()
+            is_move = bool(mods & Qt.KeyboardModifier.ShiftModifier) or (
                 event.dropAction() == Qt.DropAction.MoveAction
             )
+            show_confirm = bool(mods & Qt.KeyboardModifier.ControlModifier)
             event.acceptProposedAction()
             # Postpone handling until after dropEvent finishes and QDrag releases pointer grab
-            QTimer.singleShot(0, lambda: self.pane.handle_files_dropped(paths, target_dir, is_move))
+            QTimer.singleShot(0, lambda: self.pane.handle_files_dropped(paths, target_dir, is_move, show_confirm))
         else:
             super().dropEvent(event)
+
+
+class DragKeyFilter(QObject):
+    """Filtro de eventos na aplicação para atualizar instantaneamente o cursor ao pressionar/soltar Shift durante drag."""
+
+    def __init__(self, table_view: "FileTableView"):
+        super().__init__()
+        self.table_view = table_view
+
+    def eventFilter(self, obj, event):
+        t = event.type()
+        if t in (QEvent.Type.KeyPress, QEvent.Type.KeyRelease):
+            key = event.key()
+            if key in (Qt.Key.Key_Shift, Qt.Key.Key_Control):
+                mods = QApplication.keyboardModifiers()
+                is_move = bool(mods & Qt.KeyboardModifier.ShiftModifier)
+                c_target = self.table_view._c_move if is_move else self.table_view._c_copy
+                if QApplication.overrideCursor() is not None:
+                    QApplication.changeOverrideCursor(c_target)
+                self.table_view.update_drag_status(is_move)
+        return False
 
 
 class FileTableView(QTableView):
@@ -390,10 +489,16 @@ class FileTableView(QTableView):
         self.verticalHeader().hide()
         self.setAlternatingRowColors(True)
 
-        # Configurações de Drag and Drop
+        # Configurações de Drag and Drop e Cursores Double Commander
+        self._drag_hover_row: int = -1
+        copy_pm = get_drag_cursor_pixmap("copy")
+        move_pm = get_drag_cursor_pixmap("move")
+        self._c_copy = QCursor(copy_pm, 0, 0)
+        self._c_move = QCursor(move_pm, 0, 0)
+
         self.setDragEnabled(True)
         self.setAcceptDrops(True)
-        self.setDropIndicatorShown(True)
+        self.setDropIndicatorShown(False)
         self.setDragDropMode(QAbstractItemView.DragDropMode.DragDrop)
 
         self.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Interactive)
@@ -415,24 +520,41 @@ class FileTableView(QTableView):
         editor = self.viewport().findChild(RenameLineEdit)
         return editor is not None and editor.isVisible()
 
-    def select_and_scroll_to_path(self, path: str, retries: int = 8):
-        if not hasattr(self, "pane") or not self.pane:
-            return
+    def find_proxy_index_for_path(self, path: str) -> QModelIndex:
+        if not hasattr(self, "pane") or not self.pane or not path:
+            return QModelIndex()
         pane = self.pane
+        root_idx = self.rootIndex()
         src_idx = pane.fs_model.index(path)
         if src_idx.isValid():
             proxy_idx = pane.proxy_model.mapFromSource(src_idx)
-            if proxy_idx.isValid():
-                name_idx = proxy_idx.siblingAtColumn(0)
-                self.setCurrentIndex(name_idx)
-                self.selectionModel().select(
-                    name_idx,
-                    QItemSelectionModel.SelectionFlag.ClearAndSelect | QItemSelectionModel.SelectionFlag.Rows
-                )
-                self.scrollTo(name_idx, QAbstractItemView.ScrollHint.EnsureVisible)
-                return
+            if proxy_idx.isValid() and proxy_idx.parent() == root_idx:
+                return proxy_idx.siblingAtColumn(0)
+
+        target_name = os.path.basename(os.path.normpath(path))
+        if target_name and target_name != "..":
+            row_count = pane.proxy_model.rowCount(root_idx)
+            for r in range(row_count):
+                idx = pane.proxy_model.index(r, 0, root_idx)
+                src_r = pane.proxy_model.mapToSource(idx)
+                if pane.fs_model.fileName(src_r.siblingAtColumn(0)) == target_name:
+                    return idx
+        return QModelIndex()
+
+    def select_and_scroll_to_path(self, path: str, retries: int = 8) -> bool:
+        name_idx = self.find_proxy_index_for_path(path)
+        if name_idx.isValid():
+            self.executeDelayedItemsLayout()
+            self.setCurrentIndex(name_idx)
+            self.selectionModel().select(
+                name_idx,
+                QItemSelectionModel.SelectionFlag.ClearAndSelect | QItemSelectionModel.SelectionFlag.Rows
+            )
+            self.scrollTo(name_idx, QAbstractItemView.ScrollHint.EnsureVisible)
+            return True
         if retries > 0:
             QTimer.singleShot(40, lambda: self.select_and_scroll_to_path(path, retries - 1))
+        return False
 
     def mouseDoubleClickEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
@@ -504,18 +626,24 @@ class FileTableView(QTableView):
     def mousePressEvent(self, event):
         if hasattr(self, "pane") and self.pane:
             self.pane._pending_scroll_to_top = False
+            self.pane._pending_select_path = None
         super().mousePressEvent(event)
         self.pane_focused.emit()
 
     def wheelEvent(self, event):
         if hasattr(self, "pane") and self.pane:
             self.pane._pending_scroll_to_top = False
+            self.pane._pending_select_path = None
         super().wheelEvent(event)
 
     def keyPressEvent(self, event):
         if self.is_editing():
             super().keyPressEvent(event)
             return
+
+        if hasattr(self, "pane") and self.pane:
+            self.pane._pending_scroll_to_top = False
+            self.pane._pending_select_path = None
 
         key = event.key()
         modifiers = event.modifiers()
@@ -594,6 +722,21 @@ class FileTableView(QTableView):
         else:
             open_file_default(path)
 
+    def update_drag_status(self, is_move: bool):
+        action_name = "Mover" if is_move else "Copiar"
+        if self._drag_hover_row >= 0:
+            proxy = self.model()
+            root_idx = self.rootIndex()
+            idx = proxy.index(self._drag_hover_row, 0, root_idx)
+            src_idx = proxy.mapToSource(idx)
+            target_name = self.pane.fs_model.fileName(src_idx.siblingAtColumn(0))
+            dest_str = f"pasta '{target_name}'"
+        else:
+            dest_str = f"'{os.path.basename(self.pane.current_path) or '/'}'"
+        self.pane.status_updated.emit(
+            f"Drag & Drop: {action_name} para {dest_str}  [Shift: Mover/Copiar | Ctrl: Confirmar]"
+        )
+
     def startDrag(self, supportedActions):
         indexes = self.selectionModel().selectedRows()
         if not indexes:
@@ -626,38 +769,96 @@ class FileTableView(QTableView):
             if not move_pm.isNull():
                 drag.setDragCursor(move_pm, Qt.DropAction.MoveAction)
 
-            # Regra invertida: padrão (sem teclas) = Copiar; com Control = Mover
+            # Padrão: sem teclas = Copiar; com Shift = Mover
             mods = QApplication.keyboardModifiers()
-            default_action = (
-                Qt.DropAction.MoveAction
-                if (mods & Qt.KeyboardModifier.ControlModifier)
-                else Qt.DropAction.CopyAction
-            )
-            drag.exec(Qt.DropAction.CopyAction | Qt.DropAction.MoveAction, default_action)
+            is_move = bool(mods & Qt.KeyboardModifier.ShiftModifier)
+            default_action = Qt.DropAction.MoveAction if is_move else Qt.DropAction.CopyAction
+
+            c_initial = self._c_move if is_move else self._c_copy
+            key_filter = DragKeyFilter(self)
+            app = QApplication.instance()
+            if app:
+                app.installEventFilter(key_filter)
+                if QApplication.overrideCursor() is None:
+                    QApplication.setOverrideCursor(c_initial)
+                else:
+                    QApplication.changeOverrideCursor(c_initial)
+
+            try:
+                drag.exec(Qt.DropAction.CopyAction | Qt.DropAction.MoveAction, default_action)
+            finally:
+                if app:
+                    app.removeEventFilter(key_filter)
+                while QApplication.overrideCursor() is not None:
+                    QApplication.restoreOverrideCursor()
+                self._drag_hover_row = -1
+                self.viewport().update()
+                self.pane.update_status()
 
     def dragEnterEvent(self, event):
         if event.mimeData().hasUrls():
-            mods = QApplication.keyboardModifiers()
-            if mods & Qt.KeyboardModifier.ControlModifier:
+            mods = event.modifiers() | QApplication.keyboardModifiers()
+            is_move = bool(mods & Qt.KeyboardModifier.ShiftModifier)
+            if is_move:
                 event.setDropAction(Qt.DropAction.MoveAction)
             else:
                 event.setDropAction(Qt.DropAction.CopyAction)
+            c_target = self._c_move if is_move else self._c_copy
+            if QApplication.overrideCursor() is None:
+                QApplication.setOverrideCursor(c_target)
+            else:
+                QApplication.changeOverrideCursor(c_target)
             event.accept()
         else:
             super().dragEnterEvent(event)
 
     def dragMoveEvent(self, event):
         if event.mimeData().hasUrls():
-            mods = QApplication.keyboardModifiers()
-            if mods & Qt.KeyboardModifier.ControlModifier:
+            mods = event.modifiers() | QApplication.keyboardModifiers()
+            is_move = bool(mods & Qt.KeyboardModifier.ShiftModifier)
+            if is_move:
                 event.setDropAction(Qt.DropAction.MoveAction)
             else:
                 event.setDropAction(Qt.DropAction.CopyAction)
+
+            c_target = self._c_move if is_move else self._c_copy
+            if QApplication.overrideCursor() is not None:
+                QApplication.changeOverrideCursor(c_target)
+
+            # Identifica se o cursor está sobre uma pasta para destacar visualmente a linha
+            pos = event.position().toPoint()
+            drop_index = self.indexAt(pos)
+            target_row = -1
+            if drop_index.isValid():
+                proxy: QDirFilterProxyModel = self.model()
+                src_index = proxy.mapToSource(drop_index)
+                if self.pane.fs_model.isDir(src_index):
+                    target_row = drop_index.row()
+
+            if self._drag_hover_row != target_row:
+                self._drag_hover_row = target_row
+                self.viewport().update()
+
+            self.update_drag_status(is_move)
             event.accept()
         else:
             super().dragMoveEvent(event)
 
+    def dragLeaveEvent(self, event):
+        if self._drag_hover_row != -1:
+            self._drag_hover_row = -1
+            self.viewport().update()
+        self.pane.update_status()
+        super().dragLeaveEvent(event)
+
     def dropEvent(self, event):
+        while QApplication.overrideCursor() is not None:
+            QApplication.restoreOverrideCursor()
+        if self._drag_hover_row != -1:
+            self._drag_hover_row = -1
+            self.viewport().update()
+        self.pane.update_status()
+
         if event.mimeData().hasUrls():
             urls = event.mimeData().urls()
             paths = [u.toLocalFile() for u in urls if u.isLocalFile()]
@@ -674,13 +875,14 @@ class FileTableView(QTableView):
                     if sub_path and os.path.isdir(sub_path):
                         target_dir = sub_path
 
-            mods = QApplication.keyboardModifiers()
-            is_move = bool(mods & Qt.KeyboardModifier.ControlModifier) or (
+            mods = event.modifiers() | QApplication.keyboardModifiers()
+            is_move = bool(mods & Qt.KeyboardModifier.ShiftModifier) or (
                 event.dropAction() == Qt.DropAction.MoveAction
             )
+            show_confirm = bool(mods & Qt.KeyboardModifier.ControlModifier)
             event.acceptProposedAction()
             # Postpone handling until after dropEvent finishes and QDrag releases pointer grab
-            QTimer.singleShot(0, lambda: self.pane.handle_files_dropped(paths, target_dir, is_move))
+            QTimer.singleShot(0, lambda: self.pane.handle_files_dropped(paths, target_dir, is_move, show_confirm))
         else:
             super().dropEvent(event)
 
@@ -703,6 +905,7 @@ class QDirPane(QFrame):
         self.is_active: bool = False
         self.tree_width: int = 180
         self._pending_scroll_to_top: bool = True
+        self._pending_select_path: Optional[str] = None
 
         # Configuração visual do Frame do Painel
         self.setFrameShape(QFrame.Shape.StyledPanel)
@@ -931,7 +1134,38 @@ class QDirPane(QFrame):
         self.tree_view.viewport().update()
 
 
-    def navigate_to(self, path: str, record_history: bool = True):
+    def _resolve_child_to_select(self, previous_path: str, target_parent: str) -> Optional[str]:
+        """
+        Determina qual subdiretório direto dentro de target_parent corresponde ao caminho
+        de origem previous_path (ex: ao subir nível via '..' ou voltar para a pasta pai).
+        """
+        if not previous_path or not target_parent:
+            return None
+        try:
+            abs_prev = os.path.abspath(os.path.expanduser(previous_path))
+            abs_parent = os.path.abspath(os.path.expanduser(target_parent))
+            if abs_prev != abs_parent and os.path.commonpath([abs_prev, abs_parent]) == abs_parent:
+                rel = os.path.relpath(abs_prev, abs_parent)
+                first_part = rel.split(os.sep)[0]
+                if first_part and first_part not in (".", ".."):
+                    candidate = os.path.join(abs_parent, first_part)
+                    if os.path.lexists(candidate):
+                        return candidate
+
+            real_prev = os.path.realpath(previous_path)
+            real_parent = os.path.realpath(target_parent)
+            if real_prev != real_parent and os.path.commonpath([real_prev, real_parent]) == real_parent:
+                rel = os.path.relpath(real_prev, real_parent)
+                first_part = rel.split(os.sep)[0]
+                if first_part and first_part not in (".", ".."):
+                    candidate = os.path.join(abs_parent, first_part)
+                    if os.path.lexists(candidate):
+                        return candidate
+        except (ValueError, OSError):
+            pass
+        return None
+
+    def navigate_to(self, path: str, record_history: bool = True, select_path: Optional[str] = None):
         path = os.path.abspath(os.path.expanduser(path))
         if not os.path.exists(path) or not os.path.isdir(path):
             return
@@ -945,40 +1179,54 @@ class QDirPane(QFrame):
                     # Raiz da aba bloqueada foi excluída externamente! Desbloqueia a aba
                     self.set_tab_locked(cur_tab, False)
                 else:
-                    norm_target = os.path.realpath(path)
-                    norm_root = os.path.realpath(root_path)
-                    is_sub = False
-                    try:
-                        if norm_target == norm_root or os.path.commonpath([norm_target, norm_root]) == norm_root:
-                            is_sub = True
-                    except ValueError:
-                        is_sub = False
+                    alias = resolve_symlink_alias_under_root(path, root_path)
+                    if alias:
+                        path = alias
 
-                    if not is_sub:
+                    if not is_subpath_or_allowed_symlink(path, root_path):
                         # Fora da raiz bloqueada! Ignora completamente o comando.
                         self.txt_path.setText(self.current_path)
                         return
 
-        is_new_dir = (os.path.realpath(path) != os.path.realpath(self.current_path))
+        is_new_dir = (
+            os.path.realpath(path) != os.path.realpath(self.current_path)
+            or os.path.abspath(path) != os.path.abspath(self.current_path)
+        )
         self.current_path = path
         self.txt_path.setText(path)
 
+        has_valid_select = bool(select_path and os.path.lexists(select_path))
+
         if is_new_dir:
-            self._pending_scroll_to_top = True
             # Limpa seleção e índice corrente do diretório anterior
             self.table_view.selectionModel().clear()
             self.table_view.setCurrentIndex(QModelIndex())
+            if has_valid_select:
+                self._pending_scroll_to_top = False
+                self._pending_select_path = os.path.abspath(select_path)
+            else:
+                self._pending_scroll_to_top = True
+                self._pending_select_path = None
+        elif has_valid_select:
+            self._pending_scroll_to_top = False
+            self._pending_select_path = os.path.abspath(select_path)
 
         src_index = self.fs_model.setRootPath(path)
         proxy_index = self.proxy_model.mapFromSource(src_index)
         self.table_view.setRootIndex(proxy_index)
 
-        if is_new_dir:
-            # Garante rolagem para o início do topo imediatamente e em passagens assíncronas
-            self._reset_view_scroll_to_top()
-            QTimer.singleShot(0, self._reset_view_scroll_to_top_if_pending)
-            QTimer.singleShot(50, self._reset_view_scroll_to_top_if_pending)
-            QTimer.singleShot(150, self._reset_view_scroll_to_top_if_pending)
+        if is_new_dir or has_valid_select:
+            if self._pending_select_path:
+                self._apply_pending_select_path()
+                QTimer.singleShot(0, self._apply_pending_select_path)
+                QTimer.singleShot(50, self._apply_pending_select_path)
+                QTimer.singleShot(150, self._finalize_pending_select_path)
+            else:
+                # Garante rolagem para o início do topo imediatamente e em passagens assíncronas
+                self._reset_view_scroll_to_top()
+                QTimer.singleShot(0, self._reset_view_scroll_to_top_if_pending)
+                QTimer.singleShot(50, self._reset_view_scroll_to_top_if_pending)
+                QTimer.singleShot(150, self._reset_view_scroll_to_top_if_pending)
 
         # Atualiza título e dados da aba corrente
         if cur_tab >= 0:
@@ -1022,16 +1270,12 @@ class QDirPane(QFrame):
             if cur_tab >= 0 and self.is_tab_locked(cur_tab):
                 data = self.get_tab_data(cur_tab)
                 root = data.get("root_path")
-                if root:
-                    try:
-                        norm_target = os.path.realpath(target)
-                        norm_root = os.path.realpath(root)
-                        if norm_target != norm_root and os.path.commonpath([norm_target, norm_root]) != norm_root:
-                            return
-                    except ValueError:
-                        return
+                if root and not is_subpath_or_allowed_symlink(target, root):
+                    return
+            previous_path = self.current_path
             self.history_index -= 1
-            self.navigate_to(target, record_history=False)
+            child_to_select = self._resolve_child_to_select(previous_path, target)
+            self.navigate_to(target, record_history=False, select_path=child_to_select)
 
     def go_forward(self):
         if self.history_index < len(self.history) - 1:
@@ -1040,14 +1284,8 @@ class QDirPane(QFrame):
             if cur_tab >= 0 and self.is_tab_locked(cur_tab):
                 data = self.get_tab_data(cur_tab)
                 root = data.get("root_path")
-                if root:
-                    try:
-                        norm_target = os.path.realpath(target)
-                        norm_root = os.path.realpath(root)
-                        if norm_target != norm_root and os.path.commonpath([norm_target, norm_root]) != norm_root:
-                            return
-                    except ValueError:
-                        return
+                if root and not is_subpath_or_allowed_symlink(target, root):
+                    return
             self.history_index += 1
             self.navigate_to(target, record_history=False)
 
@@ -1058,16 +1296,25 @@ class QDirPane(QFrame):
             data = self.get_tab_data(cur_tab)
             root = data.get("root_path")
             if root and os.path.exists(root):
-                if os.path.realpath(self.current_path) == os.path.realpath(root):
+                if (
+                    os.path.realpath(self.current_path) == os.path.realpath(root)
+                    or os.path.abspath(self.current_path) == os.path.abspath(root)
+                ):
                     return
             elif root and not os.path.exists(root):
                 # A raiz da aba bloqueada foi excluída externamente! Desfaz bloqueio
                 self.set_tab_locked(cur_tab, False)
                 root = None
 
+        previous_path = self.current_path
         target_parent = find_accessible_ancestor(self.current_path, boundary_root=root)
-        if target_parent and os.path.realpath(target_parent) != os.path.realpath(self.current_path):
-            self.navigate_to(target_parent)
+        if (
+            target_parent
+            and os.path.realpath(target_parent) != os.path.realpath(self.current_path)
+            and os.path.abspath(target_parent) != os.path.abspath(self.current_path)
+        ):
+            child_to_select = self._resolve_child_to_select(previous_path, target_parent)
+            self.navigate_to(target_parent, select_path=child_to_select)
 
     def refresh(self):
         self.fs_model.setRootPath("")
@@ -1077,6 +1324,17 @@ class QDirPane(QFrame):
             if ancestor:
                 target = ancestor
         self.navigate_to(target, record_history=False)
+
+    def _apply_pending_select_path(self):
+        target = getattr(self, "_pending_select_path", None)
+        if target:
+            self.table_view.select_and_scroll_to_path(target, retries=0)
+
+    def _finalize_pending_select_path(self):
+        target = getattr(self, "_pending_select_path", None)
+        if target:
+            self.table_view.select_and_scroll_to_path(target, retries=0)
+            self._pending_select_path = None
 
     def _reset_view_scroll_to_top(self):
         self.table_view.verticalScrollBar().setValue(0)
@@ -1093,9 +1351,15 @@ class QDirPane(QFrame):
             self._reset_view_scroll_to_top()
 
     def _on_directory_loaded(self, path: str):
-        if getattr(self, "_pending_scroll_to_top", False) and os.path.realpath(path) == os.path.realpath(self.current_path):
-            self._pending_scroll_to_top = False
-            self._reset_view_scroll_to_top()
+        if os.path.realpath(path) == os.path.realpath(self.current_path):
+            if getattr(self, "_pending_select_path", None):
+                target = self._pending_select_path
+                self.table_view.select_and_scroll_to_path(target, retries=2)
+                QTimer.singleShot(0, lambda t=target: self.table_view.select_and_scroll_to_path(t, retries=0))
+                QTimer.singleShot(40, self._finalize_pending_select_path)
+            elif getattr(self, "_pending_scroll_to_top", False):
+                self._pending_scroll_to_top = False
+                self._reset_view_scroll_to_top()
 
     def on_path_entered(self):
         entered = self.txt_path.text().strip()
@@ -1189,7 +1453,7 @@ class QDirPane(QFrame):
             current_tab_path = current_tab_path.split(" (Bloqueada em:")[0]
 
         if locked:
-            root = os.path.abspath(os.path.realpath(root_path or current_tab_path))
+            root = os.path.abspath(root_path or current_tab_path)
             title = original_title or os.path.basename(root) or "/"
             data["locked"] = True
             data["root_path"] = root
@@ -1302,7 +1566,7 @@ class QDirPane(QFrame):
         self.status_updated.emit(status)
 
     # Drag & Drop Inter-painéis e entre abas
-    def handle_files_dropped(self, src_paths: List[str], dst_dir: str, is_move: bool):
+    def handle_files_dropped(self, src_paths: List[str], dst_dir: str, is_move: bool, show_confirm: bool = False):
         if not src_paths:
             return
 
@@ -1317,28 +1581,33 @@ class QDirPane(QFrame):
 
         action_name = "Mover" if is_move else "Copiar"
 
-        # Constrói o diálogo com parent no topo da janela para liberar pointer grab e manter foco
-        msg_box = QMessageBox(self.window())
-        msg_box.setWindowTitle(f"Confirmar {action_name}")
-        if len(valid_srcs) == 1:
-            item_name = os.path.basename(valid_srcs[0])
-            msg_box.setText(f"Deseja {action_name.lower()} o item '{item_name}' para:\n{dst_dir}?")
-        else:
-            msg_box.setText(f"Deseja {action_name.lower()} {len(valid_srcs)} itens para:\n{dst_dir}?")
+        if show_confirm:
+            # Diálogo de confirmação só é exibido se Ctrl estiver pressionado
+            msg_box = QMessageBox(self.window())
+            msg_box.setWindowTitle(f"Confirmar {action_name}")
+            if len(valid_srcs) == 1:
+                item_name = os.path.basename(valid_srcs[0])
+                msg_box.setText(f"Deseja {action_name.lower()} o item '{item_name}' para:\n{dst_dir}?")
+            else:
+                msg_box.setText(f"Deseja {action_name.lower()} {len(valid_srcs)} itens para:\n{dst_dir}?")
 
-        msg_box.setIcon(QMessageBox.Icon.Question)
-        btn_yes = msg_box.addButton("Sim", QMessageBox.ButtonRole.YesRole)
-        btn_no = msg_box.addButton("Não", QMessageBox.ButtonRole.NoRole)
-        msg_box.setDefaultButton(btn_yes)
-        msg_box.setEscapeButton(btn_no)
+            msg_box.setIcon(QMessageBox.Icon.Question)
+            btn_yes = msg_box.addButton("Sim", QMessageBox.ButtonRole.YesRole)
+            btn_no = msg_box.addButton("Não", QMessageBox.ButtonRole.NoRole)
+            msg_box.setDefaultButton(btn_yes)
+            msg_box.setEscapeButton(btn_no)
 
-        msg_box.exec()
+            msg_box.exec()
+            if msg_box.clickedButton() != btn_yes:
+                return
 
-        if msg_box.clickedButton() == btn_yes:
-            count, errors = copy_or_move_items(valid_srcs, dst_dir, is_move, parent=self.window())
-            if errors:
-                QMessageBox.warning(self.window(), "Erros na Operação", "\n".join(errors))
-            self.refresh()
+        if getattr(self.window(), "is_transferring", False):
+            self.status_updated.emit(f"Painel #{self.pane_id}: Uma transferência já está em andamento. Aguarde...")
+            return
+        count, errors = copy_or_move_items(valid_srcs, dst_dir, is_move, parent=self.window())
+        if errors:
+            QMessageBox.warning(self.window(), "Erros na Operação", "\n".join(errors))
+        self.refresh()
 
     # Menu de Contexto
     def show_context_menu(self, pos: QPoint):
@@ -1462,6 +1731,10 @@ class QDirPane(QFrame):
 
         if is_move and all(os.path.dirname(os.path.abspath(p)) == target_dir for p in paths):
             self.status_updated.emit(f"Painel #{self.pane_id}: Origem e destino são a mesma pasta.")
+            return
+
+        if getattr(self.window(), "is_transferring", False):
+            self.status_updated.emit(f"Painel #{self.pane_id}: Uma transferência já está em andamento. Aguarde...")
             return
 
         action_name = "Mover" if is_move else "Copiar"

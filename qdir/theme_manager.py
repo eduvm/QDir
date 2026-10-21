@@ -153,6 +153,12 @@ def setup_qt_environment():
     # o estilo real (ex: Breeze / Fusion) é aplicado logo em seguida por apply_system_theme().
     os.environ.pop("QT_STYLE_OVERRIDE", None)
 
+    # Em ambientes Wayland (ex: Hyprland), o protocolo Wayland restringe alteração dinâmica
+    # de cursores durante Drag & Drop. O backend XCB (XWayland) garante cursores nativos
+    # idênticos ao Double Commander com troca dinâmica em tempo real (Shift/Ctrl).
+    if os.environ.get("DISPLAY") and not os.environ.get("QT_QPA_PLATFORM"):
+        os.environ["QT_QPA_PLATFORM"] = "xcb"
+
 
 
 def _parse_rgb(value: str) -> Optional[RGB]:

@@ -4,14 +4,17 @@ Inclui cópia, movimentação, exclusão (lixeira/permanente), abertura em termi
 cálculo assíncrono de tamanho de pasta e Renomeação em Lote (Batch Rename).
 """
 
+import errno
 import os
 import shutil
 import subprocess
+import time
 from typing import List, Optional, Tuple
 
 from PyQt6.QtCore import QObject, QThread, Qt, pyqtSignal
 from PyQt6.QtGui import QDesktopServices
 from PyQt6.QtWidgets import (
+    QApplication,
     QCheckBox,
     QDialog,
     QDialogButtonBox,
@@ -21,6 +24,7 @@ from PyQt6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMessageBox,
+    QProgressBar,
     QPushButton,
     QStyle,
     QTableWidget,
@@ -99,6 +103,7 @@ def delete_items_permanently(paths: List[str]) -> Tuple[int, List[str]]:
 
 def format_size(size_bytes: int) -> str:
     """Formata tamanho de arquivo em formato legível (B, KB, MB, GB)."""
+    size_bytes = max(0, int(size_bytes))
     if size_bytes < 1024:
         return f"{size_bytes} B"
     elif size_bytes < 1024 * 1024:
@@ -114,6 +119,27 @@ def format_mtime(timestamp: float) -> str:
     import datetime
     dt = datetime.datetime.fromtimestamp(timestamp)
     return dt.strftime("%d/%m/%Y %H:%M:%S")
+
+
+def format_time_remaining(seconds: float) -> str:
+    """Formata tempo restante estimado em formato legível."""
+    seconds = max(0.0, float(seconds))
+    if seconds <= 0:
+        return "Concluindo..."
+    elif seconds < 60:
+        return f"aprox. {max(1, int(round(seconds)))} s"
+    elif seconds < 3600:
+        m = int(seconds // 60)
+        s = int(round(seconds % 60))
+        if s == 60:
+            m += 1
+            s = 0
+        return f"aprox. {m} min {s} s"
+    else:
+        h = int(seconds // 3600)
+        m = int((seconds % 3600) // 60)
+        return f"aprox. {h} h {m} min"
+
 
 
 class FileConflictDialog(QDialog):
@@ -261,13 +287,328 @@ class FileConflictDialog(QDialog):
         self.accept()
 
 
+class OperationCancelled(Exception):
+    """Exceção levantada quando o usuário cancela a transferência."""
+    pass
+
+
+class FileTransferWorker(QThread):
+    """Worker assíncrono para transferência de arquivos em blocos com relatório de progresso e cancelamento seguro."""
+    progress_updated = pyqtSignal(object, object, str, float, float)  # bytes_done (qint64/pyint), total_bytes, current_item, speed_bps, eta_seconds
+    item_started = pyqtSignal(str, int, int)                          # item_name, current_idx, total_items
+    operation_finished = pyqtSignal(int, list, bool)                  # success_count, errors, was_cancelled
+
+    def __init__(self, planned_items: List[Tuple[str, str]], is_move: bool = False, parent=None):
+        super().__init__(parent)
+        self.planned_items = planned_items
+        self.is_move = is_move
+        self._is_cancelled = False
+        self._bytes_copied = 0
+        self.total_bytes = 0
+        self.success_count = 0
+        self.errors: List[str] = []
+        self._start_time = 0.0
+        self._last_emit_time = 0.0
+        self._last_speed_time = 0.0
+        self._last_speed_bytes = 0
+        self._current_speed = 0.0
+
+    def cancel(self):
+        self._is_cancelled = True
+
+    def is_cancelled(self) -> bool:
+        return self._is_cancelled
+
+    def _get_item_size(self, path: str) -> int:
+        if os.path.islink(path):
+            return 0
+        if os.path.isfile(path):
+            try:
+                return os.path.getsize(path)
+            except OSError:
+                return 0
+        if os.path.isdir(path):
+            size = 0
+            for root, _, files in os.walk(path):
+                for f in files:
+                    fp = os.path.join(root, f)
+                    if not os.path.islink(fp):
+                        try:
+                            size += os.path.getsize(fp)
+                        except OSError:
+                            pass
+            return size
+        return 0
+
+    def _calculate_total_bytes(self) -> int:
+        total = 0
+        for src, _ in self.planned_items:
+            total += self._get_item_size(src)
+        return total
+
+    def _emit_progress(self, item_name: str, force: bool = False):
+        now = time.time()
+        if force or (now - self._last_emit_time >= 0.08) or (self.total_bytes > 0 and self._bytes_copied >= self.total_bytes):
+            elapsed = max(0.001, now - self._start_time)
+            dt = max(0.001, now - self._last_speed_time)
+            if dt >= 0.2:
+                inst_speed = max(0.0, (self._bytes_copied - self._last_speed_bytes) / dt)
+                if self._current_speed == 0.0:
+                    self._current_speed = inst_speed
+                else:
+                    self._current_speed = 0.7 * self._current_speed + 0.3 * inst_speed
+                self._last_speed_time = now
+                self._last_speed_bytes = self._bytes_copied
+
+            speed = self._current_speed if self._current_speed > 0 else (self._bytes_copied / elapsed)
+            rem = max(0, self.total_bytes - self._bytes_copied)
+            eta = (rem / speed) if (speed > 0 and rem > 0) else 0.0
+            self.progress_updated.emit(self._bytes_copied, self.total_bytes, item_name, speed, eta)
+            self._last_emit_time = now
+
+    def _copy_file(self, src_file: str, dst_file: str):
+        if self._is_cancelled:
+            raise OperationCancelled()
+
+        # Remove arquivo ou link existente no destino se houver
+        if os.path.exists(dst_file) or os.path.islink(dst_file):
+            try:
+                if os.path.isdir(dst_file) and not os.path.islink(dst_file):
+                    shutil.rmtree(dst_file)
+                else:
+                    os.remove(dst_file)
+            except OSError:
+                pass
+
+        os.makedirs(os.path.dirname(os.path.abspath(dst_file)), exist_ok=True)
+        chunk_size = 1024 * 1024  # 1 MB
+
+        try:
+            with open(src_file, "rb") as fsrc, open(dst_file, "wb") as fdst:
+                while True:
+                    if self._is_cancelled:
+                        raise OperationCancelled()
+                    buf = fsrc.read(chunk_size)
+                    if not buf:
+                        break
+                    fdst.write(buf)
+                    self._bytes_copied += len(buf)
+                    self._emit_progress(os.path.basename(src_file))
+
+            shutil.copystat(src_file, dst_file)
+            self._emit_progress(os.path.basename(src_file), force=True)
+        except OperationCancelled:
+            if os.path.exists(dst_file):
+                try:
+                    os.remove(dst_file)
+                except OSError:
+                    pass
+            raise
+        except Exception:
+            if os.path.exists(dst_file):
+                try:
+                    os.remove(dst_file)
+                except OSError:
+                    pass
+            raise
+
+    def _copy_dir(self, src_dir: str, dst_dir: str):
+        os.makedirs(dst_dir, exist_ok=True)
+        for root, dirs, files in os.walk(src_dir):
+            if self._is_cancelled:
+                raise OperationCancelled()
+            rel_path = os.path.relpath(root, src_dir)
+            target_root = os.path.join(dst_dir, rel_path) if rel_path != "." else dst_dir
+            for d in dirs:
+                os.makedirs(os.path.join(target_root, d), exist_ok=True)
+            for f in files:
+                if self._is_cancelled:
+                    raise OperationCancelled()
+                sf = os.path.join(root, f)
+                df = os.path.join(target_root, f)
+                if os.path.islink(sf):
+                    link_target = os.readlink(sf)
+                    if os.path.exists(df) or os.path.islink(df):
+                        os.remove(df)
+                    os.symlink(link_target, df)
+                else:
+                    self._copy_file(sf, df)
+        shutil.copystat(src_dir, dst_dir)
+
+    def run(self):
+        self.total_bytes = self._calculate_total_bytes()
+        self._start_time = time.time()
+        self._last_emit_time = self._start_time
+        self._last_speed_time = self._start_time
+        self._last_speed_bytes = 0
+        self._current_speed = 0.0
+        total_items = len(self.planned_items)
+
+        for idx, (src, target) in enumerate(self.planned_items):
+            if self._is_cancelled:
+                break
+
+            base_name = os.path.basename(src)
+            self.item_started.emit(base_name, idx + 1, total_items)
+
+            try:
+                # Otimização de movimentação na mesma partição/filesystem (instantâneo)
+                if self.is_move:
+                    try:
+                        src_size = self._get_item_size(src)
+                        if os.path.exists(target) or os.path.islink(target):
+                            if os.path.isdir(target) and not os.path.islink(target):
+                                shutil.rmtree(target)
+                            else:
+                                os.remove(target)
+                        os.rename(src, target)
+                        self._bytes_copied += src_size
+                        self._emit_progress(base_name, force=True)
+                        self.success_count += 1
+                        continue
+                    except OSError as e:
+                        if e.errno != errno.EXDEV:
+                            raise
+                        # EXDEV: partição diferente, faz cópia + remoção
+
+                if os.path.isdir(src) and not os.path.islink(src):
+                    self._copy_dir(src, target)
+                    if self.is_move and not self._is_cancelled:
+                        shutil.rmtree(src)
+                else:
+                    self._copy_file(src, target)
+                    if self.is_move and not self._is_cancelled:
+                        os.remove(src)
+
+                self.success_count += 1
+
+            except OperationCancelled:
+                break
+            except Exception as e:
+                self.errors.append(f"{base_name}: {str(e)}")
+
+        self.operation_finished.emit(self.success_count, self.errors, self._is_cancelled)
+
+
+class FileTransferProgressDialog(QDialog):
+    """Diálogo com barra de progresso, velocidade, tempo estimado e cancelamento para cópia/movimentação."""
+    cancel_requested = pyqtSignal()
+
+    def __init__(self, worker: FileTransferWorker, is_move: bool = False, parent=None):
+        super().__init__(parent)
+        self.worker = worker
+        self.is_move = is_move
+        self._started = False
+
+        action_title = "Movendo arquivos..." if is_move else "Copiando arquivos..."
+        self.setWindowTitle(action_title)
+        self.setMinimumWidth(500)
+        self.setModal(True)
+
+        layout = QVBoxLayout(self)
+        layout.setSpacing(10)
+        layout.setContentsMargins(18, 18, 18, 18)
+
+        self.lbl_item = QLabel("Preparando transferência...")
+        self.lbl_item.setStyleSheet("font-weight: bold; font-size: 13px;")
+        layout.addWidget(self.lbl_item)
+
+        self.lbl_substatus = QLabel("")
+        self.lbl_substatus.setStyleSheet("color: #777; font-size: 11px;")
+        layout.addWidget(self.lbl_substatus)
+
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setTextVisible(True)
+        self.progress_bar.setStyleSheet("""
+            QProgressBar {
+                border: 1px solid #aaa;
+                border-radius: 4px;
+                text-align: center;
+                height: 24px;
+                font-size: 11px;
+            }
+            QProgressBar::chunk {
+                background-color: #2b78e4;
+                border-radius: 3px;
+            }
+        """)
+        layout.addWidget(self.progress_bar)
+
+        self.lbl_speed_eta = QLabel("")
+        self.lbl_speed_eta.setStyleSheet("font-size: 11px;")
+        layout.addWidget(self.lbl_speed_eta)
+
+        btn_layout = QHBoxLayout()
+        btn_layout.addStretch(1)
+
+        self.btn_cancel = QPushButton("Cancelar")
+        self.btn_cancel.clicked.connect(self._on_cancel_clicked)
+        btn_layout.addWidget(self.btn_cancel)
+
+        layout.addLayout(btn_layout)
+
+        # Conexões com o worker
+        self.worker.item_started.connect(self.update_item_started)
+        self.worker.progress_updated.connect(self.update_progress)
+        self.worker.operation_finished.connect(self._on_worker_finished)
+        self.cancel_requested.connect(self.worker.cancel)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if not self._started:
+            self._started = True
+            if not self.worker.isRunning() and not self.worker.isFinished():
+                self.worker.start()
+
+    def _on_cancel_clicked(self):
+        self.btn_cancel.setEnabled(False)
+        self.btn_cancel.setText("Cancelando...")
+        self.lbl_item.setText("Cancelando transferência...")
+        self.lbl_speed_eta.setText("Aguarde a finalização dos arquivos em andamento...")
+        self.cancel_requested.emit()
+
+    def closeEvent(self, event):
+        if self.btn_cancel.isEnabled() and not self.worker.isFinished():
+            self._on_cancel_clicked()
+            event.ignore()
+        else:
+            event.accept()
+
+    def _on_worker_finished(self, success_count: int, errors: list, was_cancelled: bool):
+        self.accept()
+
+    def update_item_started(self, item_name: str, current_idx: int, total_items: int):
+        action = "Movendo" if self.is_move else "Copiando"
+        self.lbl_item.setText(f"{action}: {item_name}")
+        if total_items > 1:
+            self.lbl_substatus.setText(f"Item {current_idx} de {total_items}")
+        else:
+            self.lbl_substatus.setText("")
+
+    def update_progress(self, bytes_done: int, total_bytes: int, item_name: str, speed: float, eta: float):
+        if total_bytes > 0:
+            percent = min(100, int((bytes_done / total_bytes) * 100))
+            self.progress_bar.setValue(percent)
+            self.progress_bar.setFormat(f"{percent}% ({format_size(bytes_done)} de {format_size(total_bytes)})")
+        else:
+            self.progress_bar.setValue(100)
+            self.progress_bar.setFormat("100%")
+
+        speed_str = f"{format_size(int(speed))}/s" if speed > 0 else "--"
+        eta_str = format_time_remaining(eta) if (eta > 0 and bytes_done < total_bytes) else "--"
+        self.lbl_speed_eta.setText(f"Velocidade: {speed_str}   |   Tempo restante: {eta_str}")
+
+
 def copy_or_move_items(
     src_paths: List[str],
     dst_dir: str,
     is_move: bool = False,
     parent=None,
+    show_progress: bool = True,
 ) -> Tuple[int, List[str]]:
-    """Copia ou move múltiplos itens para o diretório de destino com diálogo de confirmação para conflitos."""
+    """Copia ou move múltiplos itens para o diretório de destino com diálogo de conflito e barra de progresso."""
     if not os.path.isdir(dst_dir):
         return 0, ["Diretório de destino inválido."]
 
@@ -284,69 +625,95 @@ def copy_or_move_items(
     has_multiple_conflicts = len(conflicts) > 1
     apply_to_all_action = None
 
-    success_count = 0
-    errors = []
+    planned_items: List[Tuple[str, str]] = []
 
     for src in clean_srcs:
-        try:
-            base_name = os.path.basename(src)
-            target = os.path.join(dst_dir, base_name)
+        base_name = os.path.basename(src)
+        target = os.path.join(dst_dir, base_name)
 
-            # Caso 1: Cópia no mesmo diretório (cria cópia automática sem perguntar)
-            if os.path.abspath(src) == os.path.abspath(target):
+        # Caso 1: Cópia no mesmo diretório (cria cópia automática sem perguntar)
+        if os.path.abspath(src) == os.path.abspath(target):
+            if is_move:
+                continue
+            name, ext = os.path.splitext(base_name)
+            counter = 1
+            target = os.path.join(dst_dir, f"{name} (cópia {counter}){ext}")
+            while os.path.exists(target):
+                counter += 1
+                target = os.path.join(dst_dir, f"{name} (cópia {counter}){ext}")
+            planned_items.append((src, target))
+            continue
+
+        # Caso 2: Conflito com item existente vindo de outra pasta
+        if os.path.exists(target):
+            action = apply_to_all_action
+            if not action:
+                dlg = FileConflictDialog(
+                    src_path=src,
+                    dst_path=target,
+                    is_move=is_move,
+                    has_multiple=has_multiple_conflicts,
+                    parent=parent,
+                )
+                dlg.exec()
+                action = dlg.result_action
+                if dlg.apply_to_all:
+                    apply_to_all_action = action
+
+            if action == FileConflictDialog.CANCEL:
+                return 0, []
+            elif action == FileConflictDialog.SKIP:
+                continue
+            elif action == FileConflictDialog.KEEP_BOTH:
                 name, ext = os.path.splitext(base_name)
                 counter = 1
+                target = os.path.join(dst_dir, f"{name} ({counter}){ext}")
                 while os.path.exists(target):
-                    target = os.path.join(dst_dir, f"{name} (cópia {counter}){ext}")
                     counter += 1
-
-            # Caso 2: Conflito com item existente vindo de outra pasta
-            elif os.path.exists(target):
-                action = apply_to_all_action
-                if not action:
-                    dlg = FileConflictDialog(
-                        src_path=src,
-                        dst_path=target,
-                        is_move=is_move,
-                        has_multiple=has_multiple_conflicts,
-                        parent=parent,
-                    )
-                    dlg.exec()
-                    action = dlg.result_action
-                    if dlg.apply_to_all:
-                        apply_to_all_action = action
-
-                if action == FileConflictDialog.CANCEL:
-                    break
-                elif action == FileConflictDialog.SKIP:
-                    continue
-                elif action == FileConflictDialog.KEEP_BOTH:
-                    name, ext = os.path.splitext(base_name)
-                    counter = 1
                     target = os.path.join(dst_dir, f"{name} ({counter}){ext}")
-                    while os.path.exists(target):
-                        counter += 1
-                        target = os.path.join(dst_dir, f"{name} ({counter}){ext}")
-                elif action == FileConflictDialog.OVERWRITE:
-                    if os.path.isdir(target) and not os.path.islink(target):
-                        shutil.rmtree(target)
-                    else:
-                        os.remove(target)
-                else:
-                    break
-
-            if is_move:
-                shutil.move(src, target)
+                planned_items.append((src, target))
+            elif action == FileConflictDialog.OVERWRITE:
+                planned_items.append((src, target))
             else:
-                if os.path.isdir(src) and not os.path.islink(src):
-                    shutil.copytree(src, target)
-                else:
-                    shutil.copy2(src, target)
-            success_count += 1
-        except Exception as e:
-            errors.append(f"{os.path.basename(src)}: {str(e)}")
+                return 0, []
+        else:
+            planned_items.append((src, target))
 
-    return success_count, errors
+    if not planned_items:
+        return 0, []
+
+    app = QApplication.instance()
+    is_offscreen = (app and app.platformName() == "offscreen")
+
+    # Localiza janela principal que possui suporte a progresso na barra de status
+    main_win = parent
+    while main_win is not None and not hasattr(main_win, "start_transfer_progress"):
+        if hasattr(main_win, "window") and callable(main_win.window):
+            candidate = main_win.window()
+            if candidate is not None and candidate is not main_win:
+                main_win = candidate
+                continue
+        if hasattr(main_win, "parent") and callable(main_win.parent):
+            main_win = main_win.parent()
+        else:
+            main_win = None
+
+    has_status_progress = (main_win is not None and hasattr(main_win, "start_transfer_progress"))
+
+    worker = FileTransferWorker(planned_items, is_move=is_move, parent=parent)
+
+    if show_progress and app is not None and not is_offscreen and has_status_progress:
+        from PyQt6.QtCore import QEventLoop
+        loop = QEventLoop()
+        main_win.start_transfer_progress(worker, is_move=is_move)
+        worker.operation_finished.connect(lambda cnt, errs, canc: loop.quit())
+        worker.start()
+        loop.exec()
+        worker.wait()
+        return worker.success_count, worker.errors
+    else:
+        worker.run()
+        return worker.success_count, worker.errors
 
 
 class BatchRenameDialog(QDialog):

@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import List, Optional
 
 from PyQt6.QtCore import QModelIndex, QTimer, Qt, pyqtSignal
-from PyQt6.QtGui import QBrush, QColor, QFont
+from PyQt6.QtGui import QBrush, QColor, QFont, QPainter, QPen
 from PyQt6.QtWidgets import (
     QAbstractItemDelegate,
     QLineEdit,
@@ -239,6 +239,12 @@ class QDirColorDelegate(QStyledItemDelegate):
 
         fg, bg, bold, italic, strikeout = self.color_engine.get_style_for_file(filename, is_dir, is_hidden)
 
+        # Destaca a linha inteira se for o alvo de um drag & drop sobre pasta
+        table = self.parent()
+        is_drag_hover = bool(table and getattr(table, "_drag_hover_row", -1) == index.row())
+        if is_drag_hover:
+            option.state |= QStyle.StateFlag.State_Selected | QStyle.StateFlag.State_HasFocus
+
         # Não sobrepõe a cor se o item estiver selecionado
         is_selected = bool(option.state & QStyle.StateFlag.State_Selected)
         if fg and fg.isValid() and not is_selected:
@@ -271,6 +277,32 @@ class QDirColorDelegate(QStyledItemDelegate):
             dimmed_text.setAlpha(120)
             option.palette.setColor(option.palette.ColorRole.Text, dimmed_text)
             option.palette.setColor(option.palette.ColorRole.WindowText, dimmed_text)
+
+    def paint(self, painter: QPainter, option: QStyleOptionViewItem, index: QModelIndex):
+        table = self.parent()
+        is_drag_hover = bool(table and getattr(table, "_drag_hover_row", -1) == index.row())
+
+        super().paint(painter, option, index)
+
+        if is_drag_hover:
+            painter.save()
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+            accent = QColor(0, 150, 255)
+            pen = QPen(accent, 1.5)
+            painter.setPen(pen)
+            r = option.rect.adjusted(0, 0, -1, -1)
+            # Bordas superior e inferior
+            painter.drawLine(r.topLeft(), r.topRight())
+            painter.drawLine(r.bottomLeft(), r.bottomRight())
+            # Borda esquerda na primeira coluna
+            if index.column() == 0:
+                painter.drawLine(r.topLeft(), r.bottomLeft())
+            # Borda direita na última coluna
+            model = index.model()
+            col_count = model.columnCount(index.parent()) if model else 4
+            if index.column() == col_count - 1:
+                painter.drawLine(r.topRight(), r.bottomRight())
+            painter.restore()
 
     def createEditor(self, parent, option, index):
         if not index.isValid() or index.column() != 0:

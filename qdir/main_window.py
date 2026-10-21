@@ -20,6 +20,7 @@ from PyQt6.QtWidgets import (
     QMainWindow,
     QMenu,
     QMessageBox,
+    QProgressBar,
     QPushButton,
     QStatusBar,
     QStyle,
@@ -379,10 +380,121 @@ class QDirMainWindow(QMainWindow):
         self.lbl_pane_status = QLabel("Pronto")
         status.addWidget(self.lbl_pane_status, stretch=1)
 
+        # Container de transferência de arquivos na barra de status
+        self.progress_container = QWidget()
+        progress_layout = QHBoxLayout(self.progress_container)
+        progress_layout.setContentsMargins(4, 0, 4, 0)
+        progress_layout.setSpacing(6)
+
+        self.lbl_transfer_info = QLabel("")
+        self.lbl_transfer_info.setStyleSheet("font-size: 11px;")
+        progress_layout.addWidget(self.lbl_transfer_info)
+
+        self.transfer_progress_bar = QProgressBar()
+        self.transfer_progress_bar.setRange(0, 100)
+        self.transfer_progress_bar.setValue(0)
+        self.transfer_progress_bar.setFixedWidth(140)
+        self.transfer_progress_bar.setFixedHeight(16)
+        self.transfer_progress_bar.setTextVisible(True)
+        self.transfer_progress_bar.setStyleSheet("""
+            QProgressBar {
+                border: 1px solid #777;
+                border-radius: 3px;
+                text-align: center;
+                font-size: 10px;
+                height: 16px;
+            }
+            QProgressBar::chunk {
+                background-color: #2b78e4;
+                border-radius: 2px;
+            }
+        """)
+        progress_layout.addWidget(self.transfer_progress_bar)
+
+        self.btn_transfer_cancel = QPushButton("✕")
+        self.btn_transfer_cancel.setToolTip("Cancelar transferência")
+        self.btn_transfer_cancel.setFixedSize(18, 18)
+        self.btn_transfer_cancel.setStyleSheet("""
+            QPushButton {
+                border: 1px solid #888;
+                border-radius: 9px;
+                font-size: 10px;
+                font-weight: bold;
+                padding: 0px;
+            }
+            QPushButton:hover {
+                background-color: #d9534f;
+                color: white;
+            }
+        """)
+        progress_layout.addWidget(self.btn_transfer_cancel)
+
+        status.addPermanentWidget(self.progress_container)
+        self.progress_container.setVisible(False)
+
         self.lbl_disk_free = QLabel("")
-        self.lbl_disk_free.setStyleSheet("padding-right: 10px;")
+        self.lbl_disk_free.setStyleSheet("padding-left: 8px; padding-right: 10px;")
         status.addPermanentWidget(self.lbl_disk_free)
 
+        self.update_status_bar()
+
+    def start_transfer_progress(self, worker, is_move: bool):
+        """Inicia e exibe o progresso de cópia/movimentação diretamente na barra de status."""
+        self.active_transfer_worker = worker
+        self.is_transferring = True
+        self.progress_container.setVisible(True)
+        self.transfer_progress_bar.setValue(0)
+        self.transfer_progress_bar.setFormat("0%")
+        action = "Movendo" if is_move else "Copiando"
+        self.lbl_transfer_info.setText(f"{action}...")
+        self.btn_transfer_cancel.setEnabled(True)
+
+        worker.item_started.connect(self.on_transfer_item_started)
+        worker.progress_updated.connect(self.on_transfer_progress_updated)
+        worker.operation_finished.connect(self.on_transfer_finished)
+        self.btn_transfer_cancel.clicked.connect(worker.cancel)
+
+    def on_transfer_item_started(self, item_name: str, current_idx: int, total_items: int):
+        action = "Movendo" if getattr(self.active_transfer_worker, "is_move", False) else "Copiando"
+        short = item_name if len(item_name) <= 24 else (item_name[:11] + "..." + item_name[-10:])
+        if total_items > 1:
+            self.lbl_transfer_info.setText(f"{action} ({current_idx}/{total_items}): {short}")
+        else:
+            self.lbl_transfer_info.setText(f"{action}: {short}")
+        self.lbl_transfer_info.setToolTip(f"{action}: {item_name}")
+
+    def on_transfer_progress_updated(self, bytes_done: int, total_bytes: int, item_name: str, speed: float, eta: float):
+        from qdir.file_ops import format_size, format_time_remaining
+        safe_done = max(0, int(bytes_done))
+        safe_total = max(0, int(total_bytes))
+
+        if safe_total > 0:
+            percent = min(100, max(0, int((safe_done / safe_total) * 100)))
+            self.transfer_progress_bar.setValue(percent)
+            self.transfer_progress_bar.setFormat(f"{percent}%")
+        else:
+            self.transfer_progress_bar.setValue(100)
+            self.transfer_progress_bar.setFormat("100%")
+
+        speed_str = f"{format_size(int(speed))}/s" if speed > 0 else "--"
+        eta_str = format_time_remaining(eta) if (eta > 0 and safe_done < safe_total) else "--"
+        action = "Movendo" if getattr(self.active_transfer_worker, "is_move", False) else "Copiando"
+        short = item_name if len(item_name) <= 20 else (item_name[:10] + "..." + item_name[-8:])
+        self.lbl_transfer_info.setText(f"{action}: {short} ({speed_str} | {eta_str})")
+        self.lbl_transfer_info.setToolTip(
+            f"{action}: {item_name}\n"
+            f"Progresso: {format_size(safe_done)} de {format_size(safe_total)} ({percent if safe_total > 0 else 100}%)\n"
+            f"Velocidade: {speed_str} | Resta: {eta_str}"
+        )
+
+    def on_transfer_finished(self, success_count: int, errors: list, was_cancelled: bool):
+        self.progress_container.setVisible(False)
+        self.is_transferring = False
+        self.active_transfer_worker = None
+        try:
+            self.btn_transfer_cancel.clicked.disconnect()
+        except TypeError:
+            pass
         self.update_status_bar()
 
     def update_status_bar(self):
@@ -720,7 +832,10 @@ class QDirMainWindow(QMainWindow):
         dlg.exec()
 
     def closeEvent(self, event):
-        """Salva larguras de colunas e estado geral ao fechar a aplicação."""
+        """Salva larguras de colunas e cancela transferências ativas ao fechar."""
+        if getattr(self, "is_transferring", False) and getattr(self, "active_transfer_worker", None):
+            self.active_transfer_worker.cancel()
+            self.active_transfer_worker.wait(2000)
         self.save_settings()
         event.accept()
 

@@ -168,8 +168,8 @@ def get_drag_cursor_pixmap(action_name: str) -> QPixmap:
     import os
     base_dir = os.path.join(os.path.dirname(__file__), "..", "resources", "cursors")
     name_map = {
-        "copy": ["ArrowCopy.cur", "copy.png"],
-        "move": ["ArrowMove.cur", "move.png"],
+        "copy": ["copy.png", "ArrowCopy.cur"],
+        "move": ["move.png", "ArrowMove.cur"],
     }
     candidates = name_map.get(action_name.lower(), [])
     for c in candidates:
